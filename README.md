@@ -10,12 +10,6 @@ A tool to compare and display differences between [Neo4j](http://neo4j.com/) gra
 
 ## Install
 
-### Homebrew
-
-```shell
-brew install c-fraser/tap/neodiff
-```
-
 ### Rust
 
 ```shell
