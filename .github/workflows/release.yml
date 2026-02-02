@@ -18,6 +18,11 @@ jobs:
         run: make check
       - name: run tests
         run: make test
+      - name: create tag
+        run: |
+          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
       # see https://github.com/goreleaser/example-rust
       - name: setup zig
         uses: mlugg/setup-zig@v2
