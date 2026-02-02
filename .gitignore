@@ -17,3 +17,4 @@ eggs/
 .venv/
 venv/
 .uv/
+.zig-cache/
