@@ -1,0 +1,26 @@
+{
+  "name": "neodiff",
+  "image": "mcr.microsoft.com/devcontainers/rust:trixie",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers-contrib/features/zsh-plugins:0": {
+      "plugins": "docker rust"
+    }
+  },
+  "postCreateCommand": {},
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "/usr/bin/zsh"
+          }
+        },
+        "yaml.schemas": {
+          "https://goreleaser.com/static/schema.json": ".goreleaser.yaml"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,69 @@
+project_name: neodiff
+
+before:
+  hooks:
+    - rustup default stable
+    - cargo install --locked cargo-zigbuild
+    - cargo fetch --locked
+
+builds:
+  - builder: rust
+    targets:
+      - x86_64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - x86_64-pc-windows-gnu
+      - aarch64-unknown-linux-gnu
+      - aarch64-apple-darwin
+
+archives:
+  - format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+    - goos: windows
+      format: zip
+
+changelog:
+  sort: asc
+
+nfpms:
+  - file_name_template: "{{ .ConventionalFileName }}"
+    maintainer: c-fraser <cfraser888@gmail.com>
+    formats:
+      - deb
+      - apk
+      - rpm
+
+universal_binaries:
+  - replace: true
+
+source:
+  enabled: true
+
+sboms:
+  - artifacts: archive
+
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+
+brews:
+  - repository:
+      owner: c-fraser
+      name: homebrew-tap
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/c-fraser/neodiff
+    description: Neo4j graph comparison tool
+    license: Apache-2.0

@@ -1,0 +1,20 @@
+name: test
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['v*']
+  pull_request:
+    branches: ['**']
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: check code
+        run: make check
+      - name: run tests
+        run: make test

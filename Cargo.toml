@@ -1,0 +1,32 @@
+[package]
+name = "neodiff"
+description = "Neo4j graph comparison tool"
+authors = ["c-fraser <cfraser888@gmail.com>"]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/neodiff"
+repository = "https://github.com/c-fraser/neodiff.git"
+keywords = ["neo4j", "graph", "diff"]
+categories = ["database", "command-line-utilities"]
+
+[dependencies]
+neo4rs = "0.8.0"
+tokio = { version = "1.49.0", features = ["full"] }
+futures = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5.0", features = ["derive", "env"] }
+regex = "1"
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+tui-tree-widget = "0.24.0"
+url = "2"
+percent-encoding = "2"
+
+[dev-dependencies]
+testcontainers = "0.26.3"
+testcontainers-modules = { version = "0.14.0", features = ["neo4j"] }
