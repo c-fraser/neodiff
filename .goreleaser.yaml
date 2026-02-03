@@ -25,6 +25,21 @@ archives:
 
 changelog:
   sort: asc
+  groups:
+    - title: Added
+      regexp: '^added:'
+      order: 0
+    - title: Changed
+      regexp: '^changed:'
+      order: 1
+    - title: Fixed
+      regexp: '^fixed:'
+      order: 2
+    - title: Removed
+      regexp: '^removed:'
+      order: 3
+    - title: Other
+      order: 999
 
 nfpms:
   - file_name_template: "{{ .ConventionalFileName }}"
