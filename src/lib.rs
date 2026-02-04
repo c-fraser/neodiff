@@ -21,12 +21,15 @@
 //!
 //! ```rust,no_run
 //! use neodiff::{diff_graphs, new_jsonl_writer, DiffConfig, GraphConfig};
+//! use std::collections::HashSet;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!     let source = GraphConfig::new("bolt://source:7687", "neo4j", "pass", None);
 //!     let target = GraphConfig::new("bolt://target:7687", "neo4j", "pass", None);
-//!     let config = DiffConfig::new(vec![], vec![], vec![], vec![], vec![".*_at$".into()], None)?;
+//!     // Only emit ModifiedNode diffs
+//!     let diff_kinds = Some(HashSet::from(["ModifiedNode".to_string()]));
+//!     let config = DiffConfig::new(vec![], vec![], vec![], vec![], vec![".*_at$".into()], None, diff_kinds, None)?;
 //!     let mut writer = new_jsonl_writer(std::io::stdout());
 //!     diff_graphs(&source, &target, &config, writer.as_mut()).await
 //! }
@@ -45,6 +48,8 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::io::Write;
 use std::pin::Pin;
+use strum::VariantNames;
+use strum_macros::{EnumString, IntoStaticStr, VariantNames as VariantNamesMacro};
 
 /// Compares the *source* and *target* *Neo4j* graphs using the `config`, then outputs the
 /// differences using the `writer`.
@@ -60,37 +65,47 @@ pub async fn diff_graphs(
 
     // report schema-level differences (labels/types that exist in only one graph)
     for label in &schema.source_only_nodes {
-        writer
-            .write(&Diff::SourceNodeLabel {
-                label: label.clone(),
-            })
-            .await?;
+        let diff = Diff::SourceNodeLabel {
+            label: label.clone(),
+        };
+        if config.should_emit(&diff) {
+            writer.write(&diff).await?;
+        }
     }
     for label in &schema.target_only_nodes {
-        writer
-            .write(&Diff::TargetNodeLabel {
-                label: label.clone(),
-            })
-            .await?;
+        let diff = Diff::TargetNodeLabel {
+            label: label.clone(),
+        };
+        if config.should_emit(&diff) {
+            writer.write(&diff).await?;
+        }
     }
     for t in &schema.source_only_rels {
-        writer
-            .write(&Diff::SourceRelationshipType {
-                relationship_type: t.clone(),
-            })
-            .await?;
+        let diff = Diff::SourceRelationshipType {
+            relationship_type: t.clone(),
+        };
+        if config.should_emit(&diff) {
+            writer.write(&diff).await?;
+        }
     }
     for t in &schema.target_only_rels {
-        writer
-            .write(&Diff::TargetRelationshipType {
-                relationship_type: t.clone(),
-            })
-            .await?;
+        let diff = Diff::TargetRelationshipType {
+            relationship_type: t.clone(),
+        };
+        if config.should_emit(&diff) {
+            writer.write(&diff).await?;
+        }
     }
 
     // compare nodes by label using sorted merge
     for label in &schema.nodes {
         let id_props = schema.identifiers.get(label);
+        // only use similarity matching for nodes without unique constraints
+        let similarity = if id_props.is_none_or(|p| p.is_empty()) {
+            config.similarity_threshold
+        } else {
+            0
+        };
         diff_stream(
             label,
             stream_nodes(
@@ -107,6 +122,8 @@ pub async fn diff_graphs(
             ),
             writer,
             config.max_diffs_per_entity,
+            &config.include_diffs,
+            similarity,
         )
         .await?;
     }
@@ -131,6 +148,8 @@ pub async fn diff_graphs(
             ),
             writer,
             config.max_diffs_per_entity,
+            &config.include_diffs,
+            config.similarity_threshold,
         )
         .await?;
     }
@@ -201,7 +220,7 @@ impl Debug for GraphConfig {
 /// Configuration to include and/or exclude differences between the graphs.
 ///
 /// Exclusions take precedence over inclusions.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DiffConfig {
     /// Only compare nodes with labels matching these regex [`Patterns`].
     /// If empty, all labels are included.
@@ -220,10 +239,22 @@ pub struct DiffConfig {
     /// Maximum number of differences to report per node label or relationship type.
     /// If `None`, all differences are reported.
     pub max_diffs_per_entity: Option<usize>,
+    /// Only write differences with [`Diff::tags`] matching these names. If `None`, write
+    /// all differences, regardless of [`Diff::tag`].
+    pub include_diffs: Option<HashSet<String>>,
+    /// Similarity threshold (0-100) for fuzzy matching nodes/relationships without unique
+    /// constraints. When unmatched source and target entities have property similarity at
+    /// or above this threshold, they are reported as modified rather than removed/added.
+    /// Default is [`DiffConfig::DEFAULT_SIMILARITY_THRESHOLD`].
+    pub similarity_threshold: u8,
 }
 
 impl DiffConfig {
+    /// Default similarity threshold for fuzzy matching.
+    pub const DEFAULT_SIMILARITY_THRESHOLD: u8 = 50;
+
     /// Creates a new [`DiffConfig`] with the given filtering configuration.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         include_node_labels: Vec<String>,
         exclude_node_labels: Vec<String>,
@@ -231,6 +262,8 @@ impl DiffConfig {
         exclude_relationship_types: Vec<String>,
         exclude_property_keys: Vec<String>,
         max_diffs_per_entity: Option<usize>,
+        include_diffs: Option<HashSet<String>>,
+        similarity_threshold: Option<u8>,
     ) -> Result<Self, regex::Error> {
         Ok(Self {
             include_node_labels: Patterns::new(include_node_labels)?,
@@ -239,7 +272,33 @@ impl DiffConfig {
             exclude_relationship_types: Patterns::new(exclude_relationship_types)?,
             exclude_property_keys: Patterns::new(exclude_property_keys)?,
             max_diffs_per_entity,
+            include_diffs,
+            similarity_threshold: similarity_threshold
+                .unwrap_or(Self::DEFAULT_SIMILARITY_THRESHOLD)
+                .min(100),
         })
+    }
+
+    /// Returns `true` if the given diff should be emitted based on its tag.
+    pub fn should_emit(&self, diff: &Diff) -> bool {
+        self.include_diffs
+            .as_ref()
+            .is_none_or(|tags| tags.contains(diff.tag()))
+    }
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self {
+            include_node_labels: Patterns::default(),
+            exclude_node_labels: Patterns::default(),
+            include_relationship_types: Patterns::default(),
+            exclude_relationship_types: Patterns::default(),
+            exclude_property_keys: Patterns::default(),
+            max_diffs_per_entity: None,
+            include_diffs: None,
+            similarity_threshold: Self::DEFAULT_SIMILARITY_THRESHOLD,
+        }
     }
 }
 
@@ -270,7 +329,7 @@ impl Debug for Patterns {
 }
 
 /// A difference between the *source* and *target* graphs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, EnumString, IntoStaticStr, VariantNamesMacro)]
 #[serde(tag = "diff")]
 pub enum Diff {
     /// A node label exists only in the *source* graph.
@@ -285,18 +344,26 @@ pub enum Diff {
     SourceNode {
         label: String,
         id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        element_id: Option<String>,
         properties: BTreeMap<String, Value>,
     },
     /// A node exists only in the *target* graph.
     TargetNode {
         label: String,
         id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        element_id: Option<String>,
         properties: BTreeMap<String, Value>,
     },
     /// A node exists in both graphs but has different properties.
     ModifiedNode {
         label: String,
         id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_element_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_element_id: Option<String>,
         changes: Vec<PropertyDiff>,
     },
     /// A relationship exists only in the *source* graph.
@@ -304,6 +371,8 @@ pub enum Diff {
         relationship_type: String,
         start_node: NodeRef,
         end_node: NodeRef,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        element_id: Option<String>,
         properties: BTreeMap<String, Value>,
     },
     /// A relationship exists only in the *target* graph.
@@ -311,6 +380,8 @@ pub enum Diff {
         relationship_type: String,
         start_node: NodeRef,
         end_node: NodeRef,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        element_id: Option<String>,
         properties: BTreeMap<String, Value>,
     },
     /// A relationship exists in both graphs but has different properties.
@@ -318,8 +389,24 @@ pub enum Diff {
         relationship_type: String,
         start_node: NodeRef,
         end_node: NodeRef,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_element_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_element_id: Option<String>,
         changes: Vec<PropertyDiff>,
     },
+}
+
+impl Diff {
+    /// Returns the [`serde`] *tag* name for this [`Diff`] variant.
+    pub fn tag(&self) -> &'static str {
+        self.into()
+    }
+
+    /// Returns all [`Diff::tag`] names.
+    pub fn tags() -> &'static [&'static str] {
+        Self::VARIANTS
+    }
 }
 
 /// A reference to a node in a relationship.
@@ -602,7 +689,7 @@ async fn query_constraints(
     Ok(constraints)
 }
 
-/// Builds a Cypher WHERE clause for include/exclude pattern matching on `var`.
+/// Builds a *Cypher* WHERE clause for include/exclude pattern matching on `var`.
 fn build_pattern_filter(var: &str, include: &Patterns, exclude: &Patterns) -> String {
     let mut conditions = Vec::new();
 
@@ -637,238 +724,150 @@ fn build_pattern_filter(var: &str, include: &Patterns, exclude: &Patterns) -> St
 type BoxStream<'a, T> =
     Pin<Box<dyn Stream<Item = Result<T, Box<dyn Error + Send + Sync>>> + Send + 'a>>;
 
-/// Common interface for nodes and relationships in sorted merge comparison.
-trait Diffable {
-    fn id(&self) -> &str;
-    fn props(&self) -> &BTreeMap<String, Value>;
-    fn source_diff(&self, key: &str) -> Diff;
-    fn target_diff(&self, key: &str) -> Diff;
-    fn modified_diff(&self, key: &str, changes: Vec<PropertyDiff>) -> Diff;
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct Node {
-    id: String,
-    props: BTreeMap<String, Value>,
-}
-
-impl Diffable for Node {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn props(&self) -> &BTreeMap<String, Value> {
-        &self.props
-    }
-
-    fn source_diff(&self, label: &str) -> Diff {
-        Diff::SourceNode {
-            label: label.into(),
-            id: self.id.clone(),
-            properties: self.props.clone(),
-        }
-    }
-
-    fn target_diff(&self, label: &str) -> Diff {
-        Diff::TargetNode {
-            label: label.into(),
-            id: self.id.clone(),
-            properties: self.props.clone(),
-        }
-    }
-
-    fn modified_diff(&self, label: &str, changes: Vec<PropertyDiff>) -> Diff {
-        Diff::ModifiedNode {
-            label: label.into(),
-            id: self.id.clone(),
-            changes,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct Rel {
-    id: String,
-    start: NodeRef,
-    end: NodeRef,
-    props: BTreeMap<String, Value>,
-}
-
-impl Diffable for Rel {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn props(&self) -> &BTreeMap<String, Value> {
-        &self.props
-    }
-
-    fn source_diff(&self, rel_type: &str) -> Diff {
-        Diff::SourceRelationship {
-            relationship_type: rel_type.into(),
-            start_node: self.start.clone(),
-            end_node: self.end.clone(),
-            properties: self.props.clone(),
-        }
-    }
-
-    fn target_diff(&self, rel_type: &str) -> Diff {
-        Diff::TargetRelationship {
-            relationship_type: rel_type.into(),
-            start_node: self.start.clone(),
-            end_node: self.end.clone(),
-            properties: self.props.clone(),
-        }
-    }
-
-    fn modified_diff(&self, rel_type: &str, changes: Vec<PropertyDiff>) -> Diff {
-        Diff::ModifiedRelationship {
-            relationship_type: rel_type.into(),
-            start_node: self.start.clone(),
-            end_node: self.end.clone(),
-            changes,
-        }
-    }
-}
-
-fn stream_nodes<'a>(
-    graph: &'a Graph,
-    label: &'a str,
-    id_props: Option<&'a Vec<String>>,
-    exclude_patterns: &'a Patterns,
-) -> BoxStream<'a, Node> {
-    Box::pin(try_stream! {
-        let props_expr = build_props_expr("properties(n)", exclude_patterns);
-
-        // use constraint properties as identity if available; otherwise hash all properties
-        let query = match id_props {
-            Some(props) if !props.is_empty() => {
-                let id_expr = props.iter()
-                    .map(|p| format!("coalesce(toString(n.{}),'')", p))
-                    .collect::<Vec<_>>()
-                    .join("+'::'+");
-                Query::new(format!(
-                    "MATCH (n:{label}) WHERE n.{} IS NOT NULL \
-                     WITH n, ({id_expr}) AS __id \
-                     RETURN __id, {props_expr} AS props \
-                     ORDER BY __id",
-                    props[0]
-                ))
-            }
-            _ => Query::new(format!(
-                "MATCH (n:{label}) \
-                 WITH n, {props_expr} AS props \
-                 WITH n, props, apoc.hashing.fingerprint(props) AS __id \
-                 RETURN __id, props \
-                 ORDER BY __id"
-            )),
-        };
-
-        let mut result = graph.execute(query).await?;
-        while let Some(row) = result.next().await? {
-            let id: String = row.get("__id").unwrap_or_default();
-            let props = value_to_props(&row.get::<Value>("props").unwrap_or_default());
-            yield Node { id, props };
-        }
-    })
-}
-
-fn stream_relationships<'a>(
-    graph: &'a Graph,
-    rel_type: &'a str,
-    exclude_patterns: &'a Patterns,
-    config: &'a DiffConfig,
-    identifiers: &'a HashMap<String, Vec<String>>,
-) -> BoxStream<'a, Rel> {
-    Box::pin(try_stream! {
-        let start_props_expr = build_props_expr("properties(s)", exclude_patterns);
-        let end_props_expr = build_props_expr("properties(e)", exclude_patterns);
-        let rel_props_expr = build_props_expr("properties(r)", exclude_patterns);
-
-        let label_filter = build_label_filter(config);
-        let start_id_expr = build_node_identity_expr("s", identifiers, exclude_patterns);
-        let end_id_expr = build_node_identity_expr("e", identifiers, exclude_patterns);
-
-        let query = Query::new(format!(
-            "MATCH (s)-[r:{rel_type}]->(e){label_filter} \
-             WITH r, s, e, \
-                  {start_props_expr} AS start_props, \
-                  {end_props_expr} AS end_props, \
-                  {rel_props_expr} AS props \
-             WITH r, s, e, start_props, end_props, props, \
-                  ({start_id_expr}) + '->' + ({end_id_expr}) + ':' + apoc.hashing.fingerprint(props) AS __id \
-             RETURN __id, labels(s) AS start_labels, start_props, labels(e) AS end_labels, end_props, props \
-             ORDER BY __id"
-        ));
-
-        let mut result = graph.execute(query).await?;
-        while let Some(row) = result.next().await? {
-            let id: String = row.get("__id").unwrap_or_default();
-            let start_labels: Vec<String> = row.get("start_labels").unwrap_or_default();
-            let end_labels: Vec<String> = row.get("end_labels").unwrap_or_default();
-            let start_props: Value = row.get("start_props").unwrap_or_default();
-            let end_props: Value = row.get("end_props").unwrap_or_default();
-            let rel_props: Value = row.get("props").unwrap_or_default();
-            yield Rel {
-                id,
-                start: NodeRef { labels: start_labels, properties: value_to_props(&start_props) },
-                end: NodeRef { labels: end_labels, properties: value_to_props(&end_props) },
-                props: value_to_props(&rel_props),
-            };
-        }
-    })
-}
-
 /// Compares two sorted streams via merge join. Items with matching IDs are compared for property
 /// differences; unmatched items are reported as *source*-only or *target*-only.
-async fn diff_stream<T: Diffable>(
+///
+/// When `similarity_threshold` > 0, unmatched source and target items are compared by property
+/// similarity. If their similarity meets or exceeds the threshold, they are reported as modified
+/// rather than separate source/target diffs.
+async fn diff_stream<T: Diffable + Clone>(
     key: &str,
     mut source: BoxStream<'_, T>,
     mut target: BoxStream<'_, T>,
     writer: &mut dyn DiffWriter,
     max_diffs: Option<usize>,
+    include_diffs: &Option<HashSet<String>>,
+    similarity_threshold: u8,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut src_item = source.next().await.transpose()?;
-    let mut tgt_item = target.next().await.transpose()?;
+    let emit = async |diff: Diff,
+                      writer: &mut dyn DiffWriter,
+                      count: &mut usize,
+                      include_diffs: &Option<HashSet<String>>|
+           -> Result<(), Box<dyn Error + Send + Sync>> {
+        if include_diffs
+            .as_ref()
+            .is_none_or(|tags| tags.contains(diff.tag()))
+        {
+            writer.write(&diff).await?;
+            *count += 1;
+        }
+        Ok(())
+    };
+
+    let use_similarity = similarity_threshold > 0;
+    let mut unmatched_source: Vec<T> = Vec::new();
+    let mut unmatched_target: Vec<T> = Vec::new();
     let mut count = 0usize;
 
-    loop {
-        if max_diffs.is_some_and(|max| count >= max) {
-            break;
-        }
+    let mut src_item = source.next().await.transpose()?;
+    let mut tgt_item = target.next().await.transpose()?;
+
+    let at_limit = |count| max_diffs.is_some_and(|max| count >= max);
+    while !at_limit(count) {
+        // sorted merge join
         match (&src_item, &tgt_item) {
             (None, None) => break,
+
             (Some(s), None) => {
-                writer.write(&s.source_diff(key)).await?;
-                count += 1;
+                if use_similarity {
+                    unmatched_source.push(s.clone());
+                } else {
+                    emit(s.source_diff(key), writer, &mut count, include_diffs).await?;
+                }
                 src_item = source.next().await.transpose()?;
             }
+
             (None, Some(t)) => {
-                writer.write(&t.target_diff(key)).await?;
-                count += 1;
+                if use_similarity {
+                    unmatched_target.push(t.clone());
+                } else {
+                    emit(t.target_diff(key), writer, &mut count, include_diffs).await?;
+                }
                 tgt_item = target.next().await.transpose()?;
             }
+
             (Some(s), Some(t)) => match s.id().cmp(t.id()) {
                 Ordering::Less => {
-                    writer.write(&s.source_diff(key)).await?;
-                    count += 1;
+                    if use_similarity {
+                        unmatched_source.push(s.clone());
+                    } else {
+                        emit(s.source_diff(key), writer, &mut count, include_diffs).await?;
+                    }
                     src_item = source.next().await.transpose()?;
                 }
                 Ordering::Greater => {
-                    writer.write(&t.target_diff(key)).await?;
-                    count += 1;
+                    if use_similarity {
+                        unmatched_target.push(t.clone());
+                    } else {
+                        emit(t.target_diff(key), writer, &mut count, include_diffs).await?;
+                    }
                     tgt_item = target.next().await.transpose()?;
                 }
                 Ordering::Equal => {
                     let changes = diff_props(s.props(), t.props());
                     if !changes.is_empty() {
-                        writer.write(&s.modified_diff(key, changes)).await?;
-                        count += 1;
+                        emit(
+                            s.modified_diff(key, t.element_id(), changes),
+                            writer,
+                            &mut count,
+                            include_diffs,
+                        )
+                        .await?;
                     }
                     src_item = source.next().await.transpose()?;
                     tgt_item = target.next().await.transpose()?;
                 }
             },
+        }
+    }
+
+    // skip similarity matching if disabled or nothing to match
+    if !use_similarity || (unmatched_source.is_empty() && unmatched_target.is_empty()) {
+        return Ok(());
+    }
+
+    // perform similarity-based matching on unmatched items
+    let threshold = f64::from(similarity_threshold) / 100.0;
+    let mut matched_targets: HashSet<usize> = HashSet::new();
+
+    for src in &unmatched_source {
+        if at_limit(count) {
+            break;
+        }
+
+        // find best matching target above threshold
+        let best_match = unmatched_target
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !matched_targets.contains(idx))
+            .map(|(idx, tgt)| (idx, compute_similarity(src.props(), tgt.props())))
+            .filter(|(_, sim)| *sim >= threshold)
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+
+        if let Some((tgt_idx, _)) = best_match {
+            matched_targets.insert(tgt_idx);
+            let changes = diff_props(src.props(), unmatched_target[tgt_idx].props());
+            if !changes.is_empty() {
+                emit(
+                    src.modified_diff(key, unmatched_target[tgt_idx].element_id(), changes),
+                    writer,
+                    &mut count,
+                    include_diffs,
+                )
+                .await?;
+            }
+        } else {
+            emit(src.source_diff(key), writer, &mut count, include_diffs).await?;
+        }
+    }
+
+    // emit remaining unmatched targets
+    for (idx, tgt) in unmatched_target.iter().enumerate() {
+        if at_limit(count) {
+            break;
+        }
+        if !matched_targets.contains(&idx) {
+            emit(tgt.target_diff(key), writer, &mut count, include_diffs).await?;
         }
     }
 
@@ -910,6 +909,241 @@ fn diff_props(
     changes
 }
 
+// return a value between 0.0 and 1.0 representing the percentage of matching properties
+fn compute_similarity(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Value>) -> f64 {
+    if left.is_empty() && right.is_empty() {
+        return 1.0;
+    }
+
+    let all_keys: HashSet<_> = left.keys().chain(right.keys()).collect();
+    if all_keys.is_empty() {
+        return 1.0;
+    }
+
+    let matching = all_keys
+        .iter()
+        .filter(|k| left.get(**k) == right.get(**k))
+        .count();
+
+    matching as f64 / all_keys.len() as f64
+}
+
+/// Common interface for nodes and relationships in sorted merge comparison.
+#[allow(dead_code)]
+trait Diffable {
+    fn id(&self) -> &str;
+    fn element_id(&self) -> &str;
+    fn props(&self) -> &BTreeMap<String, Value>;
+    fn source_diff(&self, key: &str) -> Diff;
+    fn target_diff(&self, key: &str) -> Diff;
+    fn modified_diff(&self, key: &str, target_element_id: &str, changes: Vec<PropertyDiff>)
+    -> Diff;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Node {
+    id: String,
+    element_id: String,
+    props: BTreeMap<String, Value>,
+}
+
+impl Diffable for Node {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn element_id(&self) -> &str {
+        &self.element_id
+    }
+
+    fn props(&self) -> &BTreeMap<String, Value> {
+        &self.props
+    }
+
+    fn source_diff(&self, label: &str) -> Diff {
+        Diff::SourceNode {
+            label: label.into(),
+            id: self.id.clone(),
+            element_id: Some(self.element_id.clone()),
+            properties: self.props.clone(),
+        }
+    }
+
+    fn target_diff(&self, label: &str) -> Diff {
+        Diff::TargetNode {
+            label: label.into(),
+            id: self.id.clone(),
+            element_id: Some(self.element_id.clone()),
+            properties: self.props.clone(),
+        }
+    }
+
+    fn modified_diff(
+        &self,
+        label: &str,
+        target_element_id: &str,
+        changes: Vec<PropertyDiff>,
+    ) -> Diff {
+        Diff::ModifiedNode {
+            label: label.into(),
+            id: self.id.clone(),
+            source_element_id: Some(self.element_id.clone()),
+            target_element_id: Some(target_element_id.to_string()),
+            changes,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Rel {
+    id: String,
+    element_id: String,
+    start: NodeRef,
+    end: NodeRef,
+    props: BTreeMap<String, Value>,
+}
+
+impl Diffable for Rel {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn element_id(&self) -> &str {
+        &self.element_id
+    }
+
+    fn props(&self) -> &BTreeMap<String, Value> {
+        &self.props
+    }
+
+    fn source_diff(&self, rel_type: &str) -> Diff {
+        Diff::SourceRelationship {
+            relationship_type: rel_type.into(),
+            start_node: self.start.clone(),
+            end_node: self.end.clone(),
+            element_id: Some(self.element_id.clone()),
+            properties: self.props.clone(),
+        }
+    }
+
+    fn target_diff(&self, rel_type: &str) -> Diff {
+        Diff::TargetRelationship {
+            relationship_type: rel_type.into(),
+            start_node: self.start.clone(),
+            end_node: self.end.clone(),
+            element_id: Some(self.element_id.clone()),
+            properties: self.props.clone(),
+        }
+    }
+
+    fn modified_diff(
+        &self,
+        rel_type: &str,
+        target_element_id: &str,
+        changes: Vec<PropertyDiff>,
+    ) -> Diff {
+        Diff::ModifiedRelationship {
+            relationship_type: rel_type.into(),
+            start_node: self.start.clone(),
+            end_node: self.end.clone(),
+            source_element_id: Some(self.element_id.clone()),
+            target_element_id: Some(target_element_id.to_string()),
+            changes,
+        }
+    }
+}
+
+fn stream_nodes<'a>(
+    graph: &'a Graph,
+    label: &'a str,
+    id_props: Option<&'a Vec<String>>,
+    exclude_patterns: &'a Patterns,
+) -> BoxStream<'a, Node> {
+    Box::pin(try_stream! {
+        let props_expr = build_props_expr("properties(n)", exclude_patterns);
+
+        // use constraint properties as identity if available; otherwise hash all properties
+        let query = match id_props {
+            Some(props) if !props.is_empty() => {
+                let id_expr = props.iter()
+                    .map(|p| format!("coalesce(toString(n.{}),'')", p))
+                    .collect::<Vec<_>>()
+                    .join("+'::'+");
+                Query::new(format!(
+                    "MATCH (n:{label}) WHERE n.{} IS NOT NULL \
+                     WITH n, ({id_expr}) AS __id \
+                     RETURN __id, elementId(n) AS element_id, {props_expr} AS props \
+                     ORDER BY __id",
+                    props[0]
+                ))
+            }
+            _ => Query::new(format!(
+                "MATCH (n:{label}) \
+                 WITH n, {props_expr} AS props \
+                 WITH n, props, apoc.hashing.fingerprint(props) AS __id \
+                 RETURN __id, elementId(n) AS element_id, props \
+                 ORDER BY __id"
+            )),
+        };
+
+        let mut result = graph.execute(query).await?;
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("__id").unwrap_or_default();
+            let element_id: String = row.get("element_id").unwrap_or_default();
+            let props = value_to_props(&row.get::<Value>("props").unwrap_or_default());
+            yield Node { id, element_id, props };
+        }
+    })
+}
+
+fn stream_relationships<'a>(
+    graph: &'a Graph,
+    rel_type: &'a str,
+    exclude_patterns: &'a Patterns,
+    config: &'a DiffConfig,
+    identifiers: &'a HashMap<String, Vec<String>>,
+) -> BoxStream<'a, Rel> {
+    Box::pin(try_stream! {
+        let start_props_expr = build_props_expr("properties(s)", exclude_patterns);
+        let end_props_expr = build_props_expr("properties(e)", exclude_patterns);
+        let rel_props_expr = build_props_expr("properties(r)", exclude_patterns);
+
+        let label_filter = build_label_filter(config);
+        let start_id_expr = build_node_identity_expr("s", identifiers, exclude_patterns);
+        let end_id_expr = build_node_identity_expr("e", identifiers, exclude_patterns);
+
+        let query = Query::new(format!(
+            "MATCH (s)-[r:{rel_type}]->(e){label_filter} \
+             WITH r, s, e, \
+                  {start_props_expr} AS start_props, \
+                  {end_props_expr} AS end_props, \
+                  {rel_props_expr} AS props \
+             WITH r, s, e, start_props, end_props, props, \
+                  ({start_id_expr}) + '->' + ({end_id_expr}) + ':' + apoc.hashing.fingerprint(props) AS __id \
+             RETURN __id, elementId(r) AS element_id, labels(s) AS start_labels, start_props, labels(e) AS end_labels, end_props, props \
+             ORDER BY __id"
+        ));
+
+        let mut result = graph.execute(query).await?;
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("__id").unwrap_or_default();
+            let element_id: String = row.get("element_id").unwrap_or_default();
+            let start_labels: Vec<String> = row.get("start_labels").unwrap_or_default();
+            let end_labels: Vec<String> = row.get("end_labels").unwrap_or_default();
+            let start_props: Value = row.get("start_props").unwrap_or_default();
+            let end_props: Value = row.get("end_props").unwrap_or_default();
+            let rel_props: Value = row.get("props").unwrap_or_default();
+            yield Rel {
+                id,
+                element_id,
+                start: NodeRef { labels: start_labels, properties: value_to_props(&start_props) },
+                end: NodeRef { labels: end_labels, properties: value_to_props(&end_props) },
+                props: value_to_props(&rel_props),
+            };
+        }
+    })
+}
+
 /// Builds a *WHERE* clause that filters relationships by endpoint node labels.
 fn build_label_filter(config: &DiffConfig) -> String {
     if config.include_node_labels.is_empty() && config.exclude_node_labels.is_empty() {
@@ -944,7 +1178,7 @@ fn build_label_filter(config: &DiffConfig) -> String {
     format!(" WHERE {start_ok} AND {end_ok}")
 }
 
-/// Builds a Cypher expression that computes a node's identity. Uses constraint-based
+/// Builds a *Cypher* expression that computes a node's identity. Uses constraint-based
 /// identifier properties when the node has a matching label; falls back to fingerprinting
 /// all properties (with exclusions) otherwise.
 fn build_node_identity_expr(
@@ -990,7 +1224,7 @@ fn build_node_identity_expr(
     }
 }
 
-/// Builds a Cypher expression that filters out excluded property keys from a map.
+/// Builds a *Cypher* expression that filters out excluded property keys from a map.
 fn build_props_expr(map_var: &str, exclude_patterns: &Patterns) -> String {
     if exclude_patterns.is_empty() {
         return map_var.to_string();
@@ -1412,7 +1646,16 @@ mod tests {
             "CREATE (m:Movie {title: 'Test'})",
         ])
         .await?;
-        let config = DiffConfig::new(vec!["^Movie$".into()], vec![], vec![], vec![], vec![], None)?;
+        let config = DiffConfig::new(
+            vec!["^Movie$".into()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+        )?;
         let summary = env.diff_with(config).await?.summarize().await?;
         assert_eq!(summary.total(), 0);
         Ok(())
@@ -1442,6 +1685,8 @@ mod tests {
             vec![],
             vec![],
             None,
+            None,
+            None,
         )?;
         let summary = env.diff_with(config).await?.summarize().await?;
         assert_eq!(summary.total(), 0);
@@ -1459,7 +1704,16 @@ mod tests {
             .await?;
         env.target(&["CREATE (p:Person {name: 'Alice', born: 1990, __created: timestamp()})"])
             .await?;
-        let config = DiffConfig::new(vec![], vec![], vec![], vec![], vec!["__.*$".into()], None)?;
+        let config = DiffConfig::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec!["__.*$".into()],
+            None,
+            None,
+            None,
+        )?;
         let summary = env.diff_with(config).await?.summarize().await?;
         assert_eq!(summary.total(), 0);
         Ok(())
@@ -1480,12 +1734,214 @@ mod tests {
             "CREATE (a)-[:LIKES]->(c:Movie {title: 'Different'})",
         ])
         .await?;
-        let config = DiffConfig::new(vec![], vec![], vec!["^KNOWS$".into()], vec![], vec![], None)?;
+        let config = DiffConfig::new(
+            vec![],
+            vec![],
+            vec!["^KNOWS$".into()],
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+        )?;
         let diffs = env.diff_with(config).await?.diffs();
         let likes_diffs = diffs.iter().any(|d| {
                 matches!(d, Diff::SourceRelationship { relationship_type, .. } | Diff::TargetRelationship { relationship_type, .. } if relationship_type == "LIKES")
             });
         assert!(!likes_diffs);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_diff_include_diff_tags() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let guard = get_env().await?;
+        let env = guard.as_ref().unwrap();
+        env.clear().await?;
+        env.both(&["CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE (p.name) IS UNIQUE"])
+            .await?;
+        // Create different diffs: added, removed, and modified nodes
+        env.source(&[
+            "CREATE (p:Person {name: 'Alice', born: 1990})",
+            "CREATE (p:Person {name: 'Bob', born: 1985})",
+        ])
+        .await?;
+        env.target(&[
+            "CREATE (p:Person {name: 'Alice', born: 1991})", // modified
+            "CREATE (p:Person {name: 'Charlie', born: 2000})", // added (Bob removed)
+        ])
+        .await?;
+
+        // Only include ModifiedNode diffs
+        let config = DiffConfig::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            Some(HashSet::from(["ModifiedNode".to_string()])),
+            None,
+        )?;
+        let diffs = env.diff_with(config).await?.diffs();
+
+        // Should only have ModifiedNode diffs (Alice)
+        assert!(diffs.iter().all(|d| matches!(d, Diff::ModifiedNode { .. })));
+        assert_eq!(diffs.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_diff_tag() {
+        let diff = Diff::ModifiedNode {
+            label: "Test".to_string(),
+            id: "1".to_string(),
+            source_element_id: None,
+            target_element_id: None,
+            changes: vec![],
+        };
+        assert_eq!(diff.tag(), "ModifiedNode");
+
+        let diff = Diff::SourceNode {
+            label: "Test".to_string(),
+            id: "1".to_string(),
+            element_id: None,
+            properties: Default::default(),
+        };
+        assert_eq!(diff.tag(), "SourceNode");
+    }
+
+    #[test]
+    fn test_diff_all_tags() {
+        let tags = Diff::tags();
+        assert_eq!(tags.len(), 10);
+        assert!(tags.contains(&"ModifiedNode"));
+        assert!(tags.contains(&"SourceNode"));
+        assert!(tags.contains(&"TargetRelationship"));
+    }
+
+    #[tokio::test]
+    async fn test_similarity_matching() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let guard = get_env().await?;
+        let env = guard.as_ref().unwrap();
+        env.clear().await?;
+        // Create nodes WITHOUT uniqueness constraints - they'll be matched by property hash
+        // Source and target have same node with one different property (75% similar)
+        env.source(&[
+            "CREATE (a:Item {name: 'Widget', price: 100, category: 'Tools', sku: 'W001'})",
+        ])
+        .await?;
+        env.target(&[
+            "CREATE (a:Item {name: 'Widget', price: 150, category: 'Tools', sku: 'W001'})",
+        ])
+        .await?;
+
+        // With default 75% threshold, should detect as modified (3/4 = 75% match)
+        let config = DiffConfig::default();
+        let diffs = env.diff_with(config).await?.diffs();
+
+        // Should have exactly one ModifiedNode diff (not SourceNode + TargetNode)
+        let modified_count = diffs
+            .iter()
+            .filter(|d| matches!(d, Diff::ModifiedNode { .. }))
+            .count();
+        let source_count = diffs
+            .iter()
+            .filter(|d| matches!(d, Diff::SourceNode { label, .. } if label == "Item"))
+            .count();
+        let target_count = diffs
+            .iter()
+            .filter(|d| matches!(d, Diff::TargetNode { label, .. } if label == "Item"))
+            .count();
+
+        assert_eq!(modified_count, 1, "Expected 1 ModifiedNode diff");
+        assert_eq!(source_count, 0, "Expected 0 SourceNode diffs");
+        assert_eq!(target_count, 0, "Expected 0 TargetNode diffs");
+
+        // Verify the modified diff has the correct change
+        let modified = diffs
+            .iter()
+            .find(|d| matches!(d, Diff::ModifiedNode { .. }))
+            .unwrap();
+        if let Diff::ModifiedNode { changes, .. } = modified {
+            assert_eq!(changes.len(), 1);
+            assert!(matches!(&changes[0], PropertyDiff::Changed { key, .. } if key == "price"));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_similarity_matching_disabled() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let guard = get_env().await?;
+        let env = guard.as_ref().unwrap();
+        env.clear().await?;
+        // Same setup as above but with similarity matching disabled
+        env.source(&[
+            "CREATE (a:Item {name: 'Widget', price: 100, category: 'Tools', sku: 'W001'})",
+        ])
+        .await?;
+        env.target(&[
+            "CREATE (a:Item {name: 'Widget', price: 150, category: 'Tools', sku: 'W001'})",
+        ])
+        .await?;
+
+        // With 0% threshold, similarity matching is disabled
+        let config = DiffConfig::new(vec![], vec![], vec![], vec![], vec![], None, None, Some(0))?;
+        let diffs = env.diff_with(config).await?.diffs();
+
+        // Should have SourceNode + TargetNode (no matching)
+        let modified_count = diffs
+            .iter()
+            .filter(|d| matches!(d, Diff::ModifiedNode { .. }))
+            .count();
+        let source_count = diffs
+            .iter()
+            .filter(|d| matches!(d, Diff::SourceNode { label, .. } if label == "Item"))
+            .count();
+        let target_count = diffs
+            .iter()
+            .filter(|d| matches!(d, Diff::TargetNode { label, .. } if label == "Item"))
+            .count();
+
+        assert_eq!(modified_count, 0, "Expected 0 ModifiedNode diffs");
+        assert_eq!(source_count, 1, "Expected 1 SourceNode diff");
+        assert_eq!(target_count, 1, "Expected 1 TargetNode diff");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_compute_similarity() {
+        // identical properties = 100%
+        let left: BTreeMap<String, Value> =
+            [("a".into(), Value::from(1)), ("b".into(), Value::from(2))].into();
+        let right = left.clone();
+        assert!((compute_similarity(&left, &right) - 1.0).abs() < 0.001);
+
+        // 3/4 properties match = 75%
+        let left: BTreeMap<String, Value> = [
+            ("a".into(), Value::from(1)),
+            ("b".into(), Value::from(2)),
+            ("c".into(), Value::from(3)),
+            ("d".into(), Value::from(4)),
+        ]
+        .into();
+        let right: BTreeMap<String, Value> = [
+            ("a".into(), Value::from(1)),
+            ("b".into(), Value::from(2)),
+            ("c".into(), Value::from(3)),
+            ("d".into(), Value::from(999)), // different
+        ]
+        .into();
+        assert!((compute_similarity(&left, &right) - 0.75).abs() < 0.001);
+
+        // no matching properties = 0%
+        let left: BTreeMap<String, Value> = [("a".into(), Value::from(1))].into();
+        let right: BTreeMap<String, Value> = [("a".into(), Value::from(2))].into();
+        assert!((compute_similarity(&left, &right) - 0.0).abs() < 0.001);
+
+        // empty properties = 100%
+        let empty: BTreeMap<String, Value> = BTreeMap::new();
+        assert!((compute_similarity(&empty, &empty) - 1.0).abs() < 0.001);
     }
 }

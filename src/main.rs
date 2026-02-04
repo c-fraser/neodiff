@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(target_os = "linux")]
+use arboard::SetExtLinux;
 use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -29,6 +31,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use serde_json::Value;
+use similar::{ChangeTag, TextDiff};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
@@ -45,6 +48,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let source = parse_neo4j_uri(&args.source)?;
     let target = parse_neo4j_uri(&args.target)?;
+    let include_diff_tags = args
+        .diffs
+        .map(|tags| tags.into_iter().collect::<HashSet<_>>());
     let diff_config = DiffConfig::new(
         args.nodes.unwrap_or_default(),
         args.exclude_nodes.unwrap_or_default(),
@@ -52,6 +58,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         args.exclude_relationships.unwrap_or_default(),
         args.exclude_property_keys.unwrap_or_default(),
         args.max_diffs,
+        include_diff_tags,
+        Some(args.similarity_threshold),
     )?;
 
     // use TUI if explicitly requested or if stdout is a TTY
@@ -124,6 +132,18 @@ struct Args {
     /// Maximum number of differences to report per node label or relationship type
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     max_diffs: Option<usize>,
+
+    /// Only write differences of these types (comma-separated). Options: SourceNodeLabel,
+    /// TargetNodeLabel, SourceRelationshipType, TargetRelationshipType, SourceNode,
+    /// TargetNode, ModifiedNode, SourceRelationship, TargetRelationship, ModifiedRelationship
+    #[arg(long, value_delimiter = ',')]
+    diffs: Option<Vec<String>>,
+
+    /// Similarity threshold (0-100) for fuzzy matching nodes/relationships without unique
+    /// constraints. Entities with property similarity at or above this threshold are reported
+    /// as modified rather than separate removed/added diffs. Set to 0 to disable.
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<u8>::new().range(0..=100), default_value_t = neodiff::DiffConfig::DEFAULT_SIMILARITY_THRESHOLD)]
+    similarity_threshold: u8,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -192,6 +212,8 @@ struct TuiState {
     error: Option<String>,
     // incremented when diffs change; used to avoid rebuilding tree items every frame
     generation: u64,
+    // brief status message (e.g., "Copied!") with expiration time
+    status_message: Option<(String, std::time::Instant)>,
 }
 
 impl TuiState {
@@ -202,6 +224,7 @@ impl TuiState {
             is_complete: false,
             error: None,
             generation: 0,
+            status_message: None,
         }
     }
 }
@@ -448,16 +471,28 @@ impl TuiWriter {
             }
 
             // extract state under lock; rebuild tree items only when generation changes
-            let (summary, is_complete, error) = {
+            let (summary, is_complete, error, status_msg) = {
                 let tui_state = state.lock().map_err(|e| e.to_string())?;
                 if tui_state.generation != cached_generation {
                     cached_items = Self::build_tree_items(&tui_state);
                     cached_generation = tui_state.generation;
                 }
+                // clear expired status messages
+                let status_msg = tui_state
+                    .status_message
+                    .as_ref()
+                    .and_then(|(msg, expires)| {
+                        if std::time::Instant::now() < *expires {
+                            Some(msg.clone())
+                        } else {
+                            None
+                        }
+                    });
                 (
                     tui_state.summary.clone(),
                     tui_state.is_complete,
                     tui_state.error.clone(),
+                    status_msg,
                 )
             };
             let items = &cached_items;
@@ -539,6 +574,11 @@ impl TuiWriter {
                 f.render_widget(legend_widget, header_chunks[1]);
 
                 // diff tree (main content area)
+                let tree_title = if let Some(msg) = &status_msg {
+                    format!(" Differences - {} (↑↓ ←→ navigate, c: copy, q: quit) ", msg)
+                } else {
+                    " Differences (↑↓ ←→ navigate, c: copy, q: quit) ".to_string()
+                };
                 if items.is_empty() {
                     let message = if is_complete {
                         "No differences found."
@@ -549,7 +589,7 @@ impl TuiWriter {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .title(" Differences (q quit) ")
+                                .title(tree_title)
                                 .title_style(Style::default().bold()),
                         )
                         .style(Style::default().fg(Color::DarkGray));
@@ -559,7 +599,7 @@ impl TuiWriter {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .title(" Differences (↑↓ navigate, ←→ collapse/expand, q quit) ")
+                                .title(tree_title)
                                 .title_style(Style::default().bold()),
                         )
                         .highlight_style(
@@ -600,6 +640,57 @@ impl TuiWriter {
                     }
                     KeyCode::End => {
                         tree_state.select_last();
+                    }
+                    KeyCode::Char('c') => {
+                        // copy MATCH query for selected diff to clipboard
+                        let selected_path = tree_state.selected();
+                        if !selected_path.is_empty() {
+                            let mut tui_state = state.lock().map_err(|e| e.to_string())?;
+                            if let Some(diff) =
+                                Self::find_diff_by_tree_path(&tui_state.diffs, selected_path)
+                            {
+                                if let Some(query) = Self::generate_match_query(diff) {
+                                    match arboard::Clipboard::new() {
+                                        Ok(mut clipboard) => {
+                                            // on Linux, use wait() to fork a background process
+                                            // that serves the clipboard data until another app
+                                            // claims it
+                                            #[cfg(target_os = "linux")]
+                                            let result = clipboard.set().wait().text(query);
+                                            #[cfg(not(target_os = "linux"))]
+                                            let result = clipboard.set_text(&query);
+
+                                            if result.is_ok() {
+                                                tui_state.status_message = Some((
+                                                    "Copied!".to_string(),
+                                                    std::time::Instant::now()
+                                                        + std::time::Duration::from_secs(2),
+                                                ));
+                                            } else {
+                                                tui_state.status_message = Some((
+                                                    "Copy failed".to_string(),
+                                                    std::time::Instant::now()
+                                                        + std::time::Duration::from_secs(2),
+                                                ));
+                                            }
+                                        }
+                                        Err(_) => {
+                                            tui_state.status_message = Some((
+                                                "Clipboard unavailable".to_string(),
+                                                std::time::Instant::now()
+                                                    + std::time::Duration::from_secs(2),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    tui_state.status_message = Some((
+                                        "No element ID".to_string(),
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_secs(2),
+                                    ));
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -672,10 +763,11 @@ impl TuiWriter {
                 .iter()
                 .enumerate()
                 .map(|(i, diff)| {
-                    let (text, _) = Self::format_diff(diff);
+                    let item_id = format!("schema_{}", i);
+                    let (text, _) = Self::format_diff(diff, &item_id);
                     let style =
                         DiffCategory::from_diff(diff).map_or(Style::default(), |c| c.style());
-                    TreeItem::new_leaf(format!("schema_{}", i), Self::styled_line(&text, style))
+                    TreeItem::new_leaf(item_id, Self::styled_line(&text, style))
                 })
                 .collect();
             if let Ok(item) = TreeItem::new(
@@ -693,7 +785,7 @@ impl TuiWriter {
             String,
             Vec<(String, TreeItem<'static, String>, DiffCounts, DiffCounts)>,
         > = BTreeMap::new();
-        for node_diff in node_diffs.iter() {
+        for (node_idx, node_diff) in node_diffs.iter().enumerate() {
             let (label, node_ref) = match Self::node_diff_to_ref(node_diff) {
                 Some((l, r)) => (l, r),
                 None => {
@@ -714,16 +806,14 @@ impl TuiWriter {
                 Self::node_ref_key(&node_ref)
             };
             let sort_key = Self::node_sort_key(node_diff);
-            let item_id = format!("node_{}", sort_key);
-            let (header, details) = Self::format_diff(node_diff);
+            let category_prefix = DiffCategory::from_diff(node_diff)
+                .map(|c| c.prefix())
+                .unwrap_or("?");
+            // include node_idx to guarantee uniqueness even if category + sort_key collide
+            let item_id = format!("node_{}_{}_{}", node_idx, category_prefix, sort_key);
+            let (header, details) = Self::format_diff(node_diff, &item_id);
             let style = DiffCategory::from_diff(node_diff).map_or(Style::default(), |c| c.style());
-            let mut children: Vec<TreeItem<'static, String>> = Vec::new();
-            for (j, detail) in details.iter().enumerate() {
-                children.push(TreeItem::new_leaf(
-                    format!("{}_prop_{}", item_id, j),
-                    Self::styled_line(detail, style),
-                ));
-            }
+            let mut children: Vec<TreeItem<'static, String>> = details;
             let mut node_counts = DiffCounts::default();
             let mut rel_counts = DiffCounts::default();
             node_counts.count_diff(node_diff);
@@ -733,12 +823,21 @@ impl TuiWriter {
                 }
                 children.extend(Self::build_relationship_items(rels, &node_key, &item_id));
             }
-            let header_line = if rel_counts.total() > 0 {
-                let mut spans = vec![Span::styled(format!("{} ", header), style)];
-                spans.extend(rel_suffix_spans(&rel_counts));
+            // build header line with optional element_id(s)
+            let header_line = {
+                let mut spans = vec![Span::styled(header.clone(), style)];
+                // append element_id(s) as dimmed text
+                if let Some(eid_display) = Self::format_element_ids(node_diff) {
+                    spans.push(Span::styled(
+                        format!(" {}", eid_display),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                if rel_counts.total() > 0 {
+                    spans.push(Span::raw(" "));
+                    spans.extend(rel_suffix_spans(&rel_counts));
+                }
                 Line::from(spans)
-            } else {
-                Self::styled_line(&header, style)
             };
             let node_item = if children.is_empty() {
                 TreeItem::new_leaf(item_id.clone(), header_line)
@@ -871,7 +970,18 @@ impl TuiWriter {
         }
     }
 
-    fn format_diff(diff: &Diff) -> (String, Vec<String>) {
+    fn format_diff(diff: &Diff, item_id: &str) -> (String, Vec<TreeItem<'static, String>>) {
+        let get_details = |properties: &BTreeMap<String, Value>,
+                           style: Style|
+         -> Vec<TreeItem<'static, String>> {
+            properties
+                .iter()
+                .enumerate()
+                .map(|(i, (k, v))| {
+                    Self::format_property_item(&format!("{}_prop_{}", item_id, i), "", k, v, style)
+                })
+                .collect()
+        };
         match diff {
             Diff::SourceNodeLabel { label } => (format!("- Node :{}", label), vec![]),
             Diff::TargetNodeLabel { label } => (format!("+ Node :{}", label), vec![]),
@@ -885,23 +995,25 @@ impl TuiWriter {
                 label,
                 id,
                 properties,
+                ..
             }
             | Diff::TargetNode {
                 label,
                 id,
                 properties,
+                ..
             } => {
                 let prefix = DiffCategory::from_diff(diff).map_or("-", |c| c.prefix());
+                let style = DiffCategory::from_diff(diff).map_or(Style::default(), |c| c.style());
                 let header = format!("{} (:{} {{{}}})", prefix, label, id);
-                let details: Vec<_> = properties
-                    .iter()
-                    .map(|(k, v)| format!("  {}: {}", k, Self::format_value(v)))
-                    .collect();
+                let details: Vec<_> = get_details(properties, style);
                 (header, details)
             }
-            Diff::ModifiedNode { label, id, changes } => {
+            Diff::ModifiedNode {
+                label, id, changes, ..
+            } => {
                 let header = format!("~ (:{} {{{}}})", label, id);
-                let details = Self::format_changes(changes);
+                let details = Self::format_changes(item_id, changes);
                 (header, details)
             }
             Diff::SourceRelationship {
@@ -909,14 +1021,17 @@ impl TuiWriter {
                 start_node,
                 end_node,
                 properties,
+                ..
             }
             | Diff::TargetRelationship {
                 relationship_type,
                 start_node,
                 end_node,
                 properties,
+                ..
             } => {
                 let prefix = DiffCategory::from_diff(diff).map_or("-", |c| c.prefix());
+                let style = DiffCategory::from_diff(diff).map_or(Style::default(), |c| c.style());
                 let header = format!(
                     "{} {}-[:{}]->{}",
                     prefix,
@@ -924,10 +1039,7 @@ impl TuiWriter {
                     relationship_type,
                     Self::format_node_ref(end_node)
                 );
-                let details: Vec<_> = properties
-                    .iter()
-                    .map(|(k, v)| format!("  {}: {}", k, Self::format_value(v)))
-                    .collect();
+                let details: Vec<_> = get_details(properties, style);
                 (header, details)
             }
             Diff::ModifiedRelationship {
@@ -935,6 +1047,7 @@ impl TuiWriter {
                 start_node,
                 end_node,
                 changes,
+                ..
             } => {
                 let header = format!(
                     "~ {}-[:{}]->{}",
@@ -942,7 +1055,7 @@ impl TuiWriter {
                     relationship_type,
                     Self::format_node_ref(end_node)
                 );
-                let details = Self::format_changes(changes);
+                let details = Self::format_changes(item_id, changes);
                 (header, details)
             }
         }
@@ -1002,24 +1115,366 @@ impl TuiWriter {
         Some(Line::from(spans))
     }
 
-    fn format_changes(changes: &[PropertyDiff]) -> Vec<String> {
+    // max width before wrapping property values
+    const MAX_VALUE_WIDTH: usize = 100;
+
+    fn format_changes(item_id: &str, changes: &[PropertyDiff]) -> Vec<TreeItem<'static, String>> {
         changes
             .iter()
-            .map(|c| match c {
-                PropertyDiff::Added { key, value } => {
-                    format!("  + {}: {}", key, Self::format_value(value))
-                }
-                PropertyDiff::Removed { key, value } => {
-                    format!("  - {}: {}", key, Self::format_value(value))
-                }
-                PropertyDiff::Changed { key, old, new } => format!(
-                    "  ~ {}: {} → {}",
+            .enumerate()
+            .map(|(i, c)| match c {
+                PropertyDiff::Added { key, value } => Self::format_property_item(
+                    &format!("{}_change_{}", item_id, i),
+                    "+ ",
                     key,
-                    Self::format_value(old),
-                    Self::format_value(new)
+                    value,
+                    DiffCategory::Added.style(),
+                ),
+                PropertyDiff::Removed { key, value } => Self::format_property_item(
+                    &format!("{}_change_{}", item_id, i),
+                    "- ",
+                    key,
+                    value,
+                    DiffCategory::Removed.style(),
+                ),
+                PropertyDiff::Changed { key, old, new } => Self::format_inline_diff_item(
+                    &format!("{}_change_{}", item_id, i),
+                    key,
+                    old,
+                    new,
                 ),
             })
             .collect()
+    }
+
+    fn format_property_item(
+        id: &str,
+        prefix: &str,
+        key: &str,
+        value: &Value,
+        style: Style,
+    ) -> TreeItem<'static, String> {
+        let value_str = Self::format_value(value);
+        let header = format!("  {} {}: ", prefix, key);
+        let header_len = header.len();
+
+        if header_len + value_str.len() <= Self::MAX_VALUE_WIDTH {
+            // short value - single line leaf
+            TreeItem::new_leaf(
+                id.to_string(),
+                Line::from(Span::styled(format!("{}{}", header, value_str), style)),
+            )
+        } else {
+            // long value - wrap into multiple lines
+            let wrapped = Self::wrap_text(&value_str, Self::MAX_VALUE_WIDTH - 6);
+            let children: Vec<_> = wrapped
+                .into_iter()
+                .enumerate()
+                .map(|(j, line)| {
+                    TreeItem::new_leaf(
+                        format!("{}_{}", id, j),
+                        Line::from(Span::styled(format!("      {}", line), style)),
+                    )
+                })
+                .collect();
+            let header_line = Line::from(Span::styled(format!("  {} {}:", prefix, key), style));
+            TreeItem::new(id.to_string(), header_line.clone(), children)
+                .unwrap_or_else(|_| TreeItem::new_leaf(id.to_string(), header_line))
+        }
+    }
+
+    fn format_inline_diff_item(
+        id: &str,
+        key: &str,
+        old: &Value,
+        new: &Value,
+    ) -> TreeItem<'static, String> {
+        let old_str = Self::format_value(old);
+        let new_str = Self::format_value(new);
+        let header = format!("  ~ {}: ", key);
+        let header_len = header.len();
+
+        // check if the combined diff would be too long
+        let total_len = header_len + old_str.len().max(new_str.len());
+        if total_len <= Self::MAX_VALUE_WIDTH {
+            // short diff - inline on single line
+            let diff = TextDiff::from_chars(&old_str, &new_str);
+            let mut spans = vec![Span::styled(header, DiffCategory::Modified.style())];
+
+            for change in diff.iter_all_changes() {
+                let text = change.value().to_string();
+                let span = match change.tag() {
+                    ChangeTag::Equal => Span::raw(text),
+                    ChangeTag::Delete => Span::styled(
+                        text,
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ),
+                    ChangeTag::Insert => Span::styled(
+                        text,
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                };
+                spans.push(span);
+            }
+
+            TreeItem::new_leaf(id.to_string(), Line::from(spans))
+        } else {
+            // long diff - show old and new on separate wrapped lines
+            let header_line = Line::from(Span::styled(
+                format!("  ~ {}:", key),
+                DiffCategory::Modified.style(),
+            ));
+            let mut children = Vec::new();
+
+            // old value (wrapped, in red)
+            let old_wrapped = Self::wrap_text(&old_str, Self::MAX_VALUE_WIDTH - 8);
+            for (j, line) in old_wrapped.into_iter().enumerate() {
+                children.push(TreeItem::new_leaf(
+                    format!("{}_old_{}", id, j),
+                    Line::from(Span::styled(
+                        format!("      - {}", line),
+                        Style::default().fg(Color::Red),
+                    )),
+                ));
+            }
+
+            // new value (wrapped, in green)
+            let new_wrapped = Self::wrap_text(&new_str, Self::MAX_VALUE_WIDTH - 8);
+            for (j, line) in new_wrapped.into_iter().enumerate() {
+                children.push(TreeItem::new_leaf(
+                    format!("{}_new_{}", id, j),
+                    Line::from(Span::styled(
+                        format!("      + {}", line),
+                        Style::default().fg(Color::Green),
+                    )),
+                ));
+            }
+
+            TreeItem::new(id.to_string(), header_line.clone(), children)
+                .unwrap_or_else(|_| TreeItem::new_leaf(id.to_string(), header_line))
+        }
+    }
+
+    fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+        if text.len() <= max_width {
+            return vec![text.to_string()];
+        }
+
+        let mut lines = Vec::new();
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            if remaining.len() <= max_width {
+                lines.push(remaining.to_string());
+                break;
+            }
+            // try to break at a reasonable point (space, comma, slash)
+            let break_at = remaining[..max_width]
+                .rfind(|c: char| [' ', ',', '/', '&', '?'].contains(&c))
+                .map(|i| i + 1)
+                .unwrap_or(max_width);
+            lines.push(remaining[..break_at].to_string());
+            remaining = &remaining[break_at..];
+        }
+        lines
+    }
+
+    /// Formats element ID(s) for display. For modified diffs, shows both source and target IDs.
+    fn format_element_ids(diff: &Diff) -> Option<String> {
+        match diff {
+            Diff::SourceNode { element_id, .. }
+            | Diff::TargetNode { element_id, .. }
+            | Diff::SourceRelationship { element_id, .. }
+            | Diff::TargetRelationship { element_id, .. } => {
+                element_id.as_ref().map(|eid| format!("[{}]", eid))
+            }
+            Diff::ModifiedNode {
+                source_element_id,
+                target_element_id,
+                ..
+            }
+            | Diff::ModifiedRelationship {
+                source_element_id,
+                target_element_id,
+                ..
+            } => match (source_element_id.as_ref(), target_element_id.as_ref()) {
+                (Some(src), Some(tgt)) => Some(format!("[src: {} | tgt: {}]", src, tgt)),
+                (Some(src), None) => Some(format!("[src: {}]", src)),
+                (None, Some(tgt)) => Some(format!("[tgt: {}]", tgt)),
+                (None, None) => None,
+            },
+            _ => None,
+        }
+    }
+
+    // generates a MATCH query for the selected diff's entity
+    fn generate_match_query(diff: &Diff) -> Option<String> {
+        match diff {
+            Diff::SourceNode {
+                element_id: Some(eid),
+                ..
+            } => Some(format!("MATCH (n) WHERE elementId(n) = '{}' RETURN n", eid)),
+            Diff::TargetNode {
+                element_id: Some(eid),
+                ..
+            } => Some(format!("MATCH (n) WHERE elementId(n) = '{}' RETURN n", eid)),
+            Diff::ModifiedNode {
+                source_element_id,
+                target_element_id,
+                ..
+            } => {
+                let src = source_element_id.as_deref()?;
+                let tgt = target_element_id.as_deref()?;
+                Some(format!(
+                    "// source\nMATCH (n) WHERE elementId(n) = '{}' RETURN n\n// target\nMATCH (n) WHERE elementId(n) = '{}' RETURN n",
+                    src, tgt
+                ))
+            }
+            Diff::SourceRelationship {
+                element_id: Some(eid),
+                ..
+            } => Some(format!(
+                "MATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r",
+                eid
+            )),
+            Diff::TargetRelationship {
+                element_id: Some(eid),
+                ..
+            } => Some(format!(
+                "MATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r",
+                eid
+            )),
+            Diff::ModifiedRelationship {
+                source_element_id,
+                target_element_id,
+                ..
+            } => {
+                let src = source_element_id.as_deref()?;
+                let tgt = target_element_id.as_deref()?;
+                Some(format!(
+                    "// source\nMATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r\n// target\nMATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r",
+                    src, tgt
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    // finds the diff corresponding to a tree selection path
+    fn find_diff_by_tree_path<'a>(diffs: &'a [Diff], path: &[String]) -> Option<&'a Diff> {
+        // tree path examples:
+        // ["nodes", "label_Person", "node_Alice"] -> node diff with id "Alice"
+        // ["schema", "schema_0"] -> first schema diff
+        if path.is_empty() {
+            return None;
+        }
+
+        // check for node path: ["nodes", "label_X", "node_{idx}_{category}_{id}"]
+        if path.len() >= 3 && path[0] == "nodes" {
+            let last = path.last()?;
+            // parse format: "node_{idx}_{prefix}_{id}" where prefix is -, +, or ~
+            if let Some(rest) = last.strip_prefix("node_") {
+                // find the index (first segment before _)
+                let first_underscore = rest.find('_')?;
+                let idx_str = &rest[..first_underscore];
+                let idx: usize = idx_str.parse().ok()?;
+                let after_idx = &rest[first_underscore + 1..];
+
+                // extract category prefix and id
+                let (category_char, id) = if let Some(id) = after_idx.strip_prefix("-_") {
+                    (Some('-'), id)
+                } else if let Some(id) = after_idx.strip_prefix("+_") {
+                    (Some('+'), id)
+                } else if let Some(id) = after_idx.strip_prefix("~_") {
+                    (Some('~'), id)
+                } else {
+                    // fallback for unknown prefix
+                    (None, after_idx)
+                };
+
+                // use the index to directly get the diff from node_diffs
+                let node_diffs: Vec<_> = diffs
+                    .iter()
+                    .filter(|d| {
+                        matches!(
+                            d,
+                            Diff::SourceNode { .. }
+                                | Diff::TargetNode { .. }
+                                | Diff::ModifiedNode { .. }
+                        )
+                    })
+                    .collect();
+
+                if let Some(&diff) = node_diffs.get(idx) {
+                    // verify it matches the expected id and category
+                    let id_matches = match diff {
+                        Diff::SourceNode { id: node_id, .. }
+                        | Diff::TargetNode { id: node_id, .. }
+                        | Diff::ModifiedNode { id: node_id, .. } => node_id == id,
+                        _ => false,
+                    };
+                    let category_matches = match category_char {
+                        Some('-') => matches!(diff, Diff::SourceNode { .. }),
+                        Some('+') => matches!(diff, Diff::TargetNode { .. }),
+                        Some('~') => matches!(diff, Diff::ModifiedNode { .. }),
+                        None | Some(_) => true,
+                    };
+                    if id_matches && category_matches {
+                        return Some(diff);
+                    }
+                }
+                return None;
+            }
+            if let Some(key) = last.strip_prefix("synthetic_") {
+                // synthetic nodes don't have direct diffs, but their relationships do
+                // try to find a relationship attached to this synthetic node
+                return diffs.iter().find(|d| match d {
+                    Diff::SourceRelationship { start_node, .. }
+                    | Diff::TargetRelationship { start_node, .. }
+                    | Diff::ModifiedRelationship { start_node, .. } => {
+                        Self::node_ref_key(start_node) == key
+                    }
+                    _ => false,
+                });
+            }
+        }
+
+        // check for relationship path under a node: [..., "node_X_rel_N"]
+        for item in path.iter() {
+            if item.contains("_rel_") {
+                // this is a relationship item; we need to find which rel it corresponds to
+                // the format is "{node_item_id}_rel_{index}"
+                // we can try to match by index within the relationship diffs
+                // For now, return None as relationship selection is more complex
+                return None;
+            }
+        }
+
+        // check for schema path: ["schema", "schema_N"]
+        if path.len() >= 2
+            && path[0] == "schema"
+            && let Some(idx_str) = path[1].strip_prefix("schema_")
+            && let Ok(idx) = idx_str.parse::<usize>()
+        {
+            let schema_diffs: Vec<_> = diffs
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d,
+                        Diff::SourceNodeLabel { .. }
+                            | Diff::TargetNodeLabel { .. }
+                            | Diff::SourceRelationshipType { .. }
+                            | Diff::TargetRelationshipType { .. }
+                    )
+                })
+                .collect();
+            return schema_diffs.get(idx).copied();
+        }
+
+        None
     }
 
     fn format_node_ref(node: &NodeRef) -> String {
@@ -1043,6 +1498,7 @@ impl TuiWriter {
     fn format_value(v: &Value) -> String {
         match v {
             Value::String(s) => format!("\"{}\"", s),
+            Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
             _ => v.to_string(),
         }
     }
