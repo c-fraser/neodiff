@@ -86,34 +86,33 @@ pub async fn diff_graphs(
     }
 
     // report schema-level differences (labels/types that exist in only one graph)
-    for label in &schema.source_only_nodes {
-        let diff = Diff::SourceNodeLabel {
-            label: label.clone(),
-        };
-        if config.should_emit(&diff) {
-            writer.write(&diff).await?;
-        }
-    }
-    for label in &schema.target_only_nodes {
-        let diff = Diff::TargetNodeLabel {
-            label: label.clone(),
-        };
-        if config.should_emit(&diff) {
-            writer.write(&diff).await?;
-        }
-    }
-    for t in &schema.source_only_rels {
-        let diff = Diff::SourceRelationshipType {
-            relationship_type: t.clone(),
-        };
-        if config.should_emit(&diff) {
-            writer.write(&diff).await?;
-        }
-    }
-    for t in &schema.target_only_rels {
-        let diff = Diff::TargetRelationshipType {
-            relationship_type: t.clone(),
-        };
+    let schema_diffs = schema
+        .source_only_nodes
+        .iter()
+        .map(|l| Diff::SourceNodeLabel { label: l.clone() })
+        .chain(
+            schema
+                .target_only_nodes
+                .iter()
+                .map(|l| Diff::TargetNodeLabel { label: l.clone() }),
+        )
+        .chain(
+            schema
+                .source_only_rels
+                .iter()
+                .map(|t| Diff::SourceRelationshipType {
+                    relationship_type: t.clone(),
+                }),
+        )
+        .chain(
+            schema
+                .target_only_rels
+                .iter()
+                .map(|t| Diff::TargetRelationshipType {
+                    relationship_type: t.clone(),
+                }),
+        );
+    for diff in schema_diffs {
         if config.should_emit(&diff) {
             writer.write(&diff).await?;
         }
@@ -365,6 +364,15 @@ impl Patterns {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    fn to_cypher_list(&self) -> String {
+        // formats the patterns as a comma-separated list of quoted strings
+        self.0
+            .iter()
+            .map(|r| format!("'{}'", r.as_str()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 impl Debug for Patterns {
@@ -613,25 +621,33 @@ async fn discover_schema(
     config: &DiffConfig,
 ) -> Result<Schema, Box<dyn Error + Send + Sync>> {
     let (src_nodes, tgt_nodes, src_rels, tgt_rels, src_constraints, tgt_constraints) = tokio::try_join!(
-        query_labels(
+        query_names(
             source,
+            "db.labels",
+            "label",
             &config.include_node_labels,
-            &config.exclude_node_labels
+            &config.exclude_node_labels,
         ),
-        query_labels(
+        query_names(
             target,
+            "db.labels",
+            "label",
             &config.include_node_labels,
-            &config.exclude_node_labels
+            &config.exclude_node_labels,
         ),
-        query_relationship_types(
+        query_names(
             source,
+            "db.relationshipTypes",
+            "relationshipType",
             &config.include_relationship_types,
-            &config.exclude_relationship_types
+            &config.exclude_relationship_types,
         ),
-        query_relationship_types(
+        query_names(
             target,
+            "db.relationshipTypes",
+            "relationshipType",
             &config.include_relationship_types,
-            &config.exclude_relationship_types
+            &config.exclude_relationship_types,
         ),
         query_constraints(source),
         query_constraints(target),
@@ -674,40 +690,23 @@ async fn discover_schema(
     })
 }
 
-async fn query_labels(
+async fn query_names(
     graph: &Graph,
+    procedure: &str,
+    var: &str,
     include: &Patterns,
     exclude: &Patterns,
 ) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
-    let where_clause = build_pattern_filter("label", include, exclude);
-    let query = format!("CALL db.labels() YIELD label{where_clause} RETURN label");
+    let where_clause = build_pattern_filter(var, include, exclude);
+    let query = format!("CALL {procedure}() YIELD {var}{where_clause} RETURN {var}");
     let mut result = graph.execute(Query::new(query)).await?;
-    let mut labels = HashSet::new();
+    let mut names = HashSet::new();
     while let Some(row) = result.next().await? {
-        if let Ok(label) = row.get::<String>("label") {
-            labels.insert(label);
+        if let Ok(name) = row.get::<String>(var) {
+            names.insert(name);
         }
     }
-    Ok(labels)
-}
-
-async fn query_relationship_types(
-    graph: &Graph,
-    include: &Patterns,
-    exclude: &Patterns,
-) -> Result<HashSet<String>, Box<dyn Error + Send + Sync>> {
-    let where_clause = build_pattern_filter("relationshipType", include, exclude);
-    let query = format!(
-        "CALL db.relationshipTypes() YIELD relationshipType{where_clause} RETURN relationshipType"
-    );
-    let mut result = graph.execute(Query::new(query)).await?;
-    let mut types = HashSet::new();
-    while let Some(row) = result.next().await? {
-        if let Ok(t) = row.get::<String>("relationshipType") {
-            types.insert(t);
-        }
-    }
-    Ok(types)
+    Ok(names)
 }
 
 async fn query_constraints(
@@ -741,23 +740,13 @@ fn build_pattern_filter(var: &str, include: &Patterns, exclude: &Patterns) -> St
     let mut conditions = Vec::new();
 
     if !exclude.is_empty() {
-        let patterns = exclude
-            .0
-            .iter()
-            .map(|r| format!("'{}'", r.as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("NOT any(p IN [{patterns}] WHERE {var} =~ p)"));
+        let list = exclude.to_cypher_list();
+        conditions.push(format!("NOT any(p IN [{list}] WHERE {var} =~ p)"));
     }
 
     if !include.is_empty() {
-        let patterns = include
-            .0
-            .iter()
-            .map(|r| format!("'{}'", r.as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("any(p IN [{patterns}] WHERE {var} =~ p)"));
+        let list = include.to_cypher_list();
+        conditions.push(format!("any(p IN [{list}] WHERE {var} =~ p)"));
     }
 
     if conditions.is_empty() {
@@ -974,10 +963,6 @@ fn diff_props(
 
 // return a value between 0.0 and 1.0 representing the percentage of matching properties
 fn compute_similarity(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Value>) -> f64 {
-    if left.is_empty() && right.is_empty() {
-        return 1.0;
-    }
-
     let all_keys: HashSet<_> = left.keys().chain(right.keys()).collect();
     if all_keys.is_empty() {
         return 1.0;
@@ -1215,24 +1200,12 @@ fn build_label_filter(config: &DiffConfig) -> String {
 
     let mut conditions = Vec::new();
     if !config.exclude_node_labels.is_empty() {
-        let patterns = config
-            .exclude_node_labels
-            .0
-            .iter()
-            .map(|r| format!("'{}'", r.as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("NOT any(p IN [{patterns}] WHERE lbl =~ p)"));
+        let list = config.exclude_node_labels.to_cypher_list();
+        conditions.push(format!("NOT any(p IN [{list}] WHERE lbl =~ p)"));
     }
     if !config.include_node_labels.is_empty() {
-        let patterns = config
-            .include_node_labels
-            .0
-            .iter()
-            .map(|r| format!("'{}'", r.as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("any(p IN [{patterns}] WHERE lbl =~ p)"));
+        let list = config.include_node_labels.to_cypher_list();
+        conditions.push(format!("any(p IN [{list}] WHERE lbl =~ p)"));
     }
 
     let filter = conditions.join(" AND ");
@@ -1293,27 +1266,17 @@ fn build_props_expr(map_var: &str, exclude_patterns: &Patterns) -> String {
         return map_var.to_string();
     }
 
-    let patterns = exclude_patterns
-        .0
-        .iter()
-        .map(|r| format!("'{}'", r.as_str()))
-        .collect::<Vec<_>>()
-        .join(",");
-
+    let list = exclude_patterns.to_cypher_list();
     format!(
-        "apoc.map.fromPairs([k IN keys({map_var}) WHERE NOT any(p IN [{patterns}] WHERE k =~ p) | [k, {map_var}[k]]])"
+        "apoc.map.fromPairs([k IN keys({map_var}) WHERE NOT any(p IN [{list}] WHERE k =~ p) | [k, {map_var}[k]]])"
     )
 }
 
 /// Converts a JSON object Value to a property map; non-objects yield empty map.
 fn value_to_props(data: &Value) -> BTreeMap<String, Value> {
-    let mut props = BTreeMap::new();
-    if let Some(obj) = data.as_object() {
-        for (k, v) in obj {
-            props.insert(k.clone(), v.clone());
-        }
-    }
-    props
+    data.as_object()
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
 }
 
 struct JsonLinesWriter<T: Write + Send> {

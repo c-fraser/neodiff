@@ -8,6 +8,10 @@
 
 A tool to compare and display differences between [Neo4j](http://neo4j.com/) graphs.
 
+<video autoplay loop muted playsinline width="100%">                                                                                                                               
+<source src="demo/demo.webm" type="video/webm">                                                                                                                                  
+</video>  
+
 ## Install
 
 ### Rust
@@ -15,6 +19,8 @@ A tool to compare and display differences between [Neo4j](http://neo4j.com/) gra
 ```shell
 cargo install neodiff
 ```
+
+> Requires [Rust](https://rust-lang.org/) *1.85+*.
 
 ### Releases
 

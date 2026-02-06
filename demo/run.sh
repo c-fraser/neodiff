@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 
-# Demonstrate neodiff comparing Neo4j databases.
-#
-# Usage:
-#   ./run.sh
+if [ $# -gt 0 ]; then
+    echo 'Demonstrate neodiff comparing Neo4j databases.'
+    echo ''
+    echo 'Usage:'
+    echo '  ./run.sh'
+    exit 0
+fi
 
 set -euo pipefail
 

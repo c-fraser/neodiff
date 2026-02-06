@@ -10,7 +10,7 @@ help: ## show this help
 
 all: check build test ## check, build, and test all code
 
-build: ## build rust release binaries
+build: clean ## build rust release binaries
 	cargo build --release
 
 check: ## check, format, and lint rust code

@@ -1,13 +1,24 @@
 {
   "name": "neodiff",
-  "image": "mcr.microsoft.com/devcontainers/rust:trixie",
+  "image": "mcr.microsoft.com/devcontainers/rust:bookworm",
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
-    "ghcr.io/devcontainers-contrib/features/zsh-plugins:0": {
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/devcontainers-extra/features/zsh-plugins:0": {
       "plugins": "docker rust"
     }
   },
-  "postCreateCommand": {},
+  "postCreateCommand": {
+    "install docsify": "npm i docsify-cli -g"
+  },
+  "forwardPorts": [
+    3000
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "docs site"
+    }
+  },
   "customizations": {
     "vscode": {
       "settings": {

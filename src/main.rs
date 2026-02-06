@@ -243,6 +243,13 @@ impl TuiState {
             progress: None,
         }
     }
+
+    fn set_status(&mut self, msg: &str) {
+        self.status_message = Some((
+            msg.to_string(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        ));
+    }
 }
 
 enum TuiMessage {
@@ -814,34 +821,18 @@ impl TuiWriter {
                                             #[cfg(not(target_os = "linux"))]
                                             let result = clipboard.set_text(&query);
 
-                                            if result.is_ok() {
-                                                tui_state.status_message = Some((
-                                                    "Copied!".to_string(),
-                                                    std::time::Instant::now()
-                                                        + std::time::Duration::from_secs(2),
-                                                ));
+                                            tui_state.set_status(if result.is_ok() {
+                                                "Copied!"
                                             } else {
-                                                tui_state.status_message = Some((
-                                                    "Copy failed".to_string(),
-                                                    std::time::Instant::now()
-                                                        + std::time::Duration::from_secs(2),
-                                                ));
-                                            }
+                                                "Copy failed"
+                                            });
                                         }
                                         Err(_) => {
-                                            tui_state.status_message = Some((
-                                                "Clipboard unavailable".to_string(),
-                                                std::time::Instant::now()
-                                                    + std::time::Duration::from_secs(2),
-                                            ));
+                                            tui_state.set_status("Clipboard unavailable");
                                         }
                                     }
                                 } else {
-                                    tui_state.status_message = Some((
-                                        "No element ID".to_string(),
-                                        std::time::Instant::now()
-                                            + std::time::Duration::from_secs(2),
-                                    ));
+                                    tui_state.set_status("No element ID");
                                 }
                             }
                         }
@@ -1455,9 +1446,9 @@ impl TuiWriter {
                 target_element_id,
                 ..
             } => match (source_element_id.as_ref(), target_element_id.as_ref()) {
-                (Some(src), Some(tgt)) => Some(format!("[src: {} | tgt: {}]", src, tgt)),
-                (Some(src), None) => Some(format!("[src: {}]", src)),
-                (None, Some(tgt)) => Some(format!("[tgt: {}]", tgt)),
+                (Some(src), Some(tgt)) => Some(format!("[source: {} | target: {}]", src, tgt)),
+                (Some(src), None) => Some(format!("[source: {}]", src)),
+                (None, Some(tgt)) => Some(format!("[target: {}]", tgt)),
                 (None, None) => None,
             },
             _ => None,
@@ -1470,8 +1461,8 @@ impl TuiWriter {
             Diff::SourceNode {
                 element_id: Some(eid),
                 ..
-            } => Some(format!("MATCH (n) WHERE elementId(n) = '{}' RETURN n", eid)),
-            Diff::TargetNode {
+            }
+            | Diff::TargetNode {
                 element_id: Some(eid),
                 ..
             } => Some(format!("MATCH (n) WHERE elementId(n) = '{}' RETURN n", eid)),
@@ -1490,11 +1481,8 @@ impl TuiWriter {
             Diff::SourceRelationship {
                 element_id: Some(eid),
                 ..
-            } => Some(format!(
-                "MATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r",
-                eid
-            )),
-            Diff::TargetRelationship {
+            }
+            | Diff::TargetRelationship {
                 element_id: Some(eid),
                 ..
             } => Some(format!(

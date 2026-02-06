@@ -2,8 +2,9 @@
 name = "neodiff"
 description = "Neo4j graph comparison tool"
 authors = ["c-fraser <cfraser888@gmail.com>"]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
+rust-version = "1.85.0"
 license = "Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/neodiff"
