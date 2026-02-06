@@ -32,13 +32,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, IsTerminal};
 use std::process;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::Registry;
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 use url::Url;
 
@@ -71,7 +73,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .unwrap_or_else(|| io::stdout().is_terminal());
 
     if use_tui {
-        let mut writer = TuiWriter::new();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let layer = TuiTracingLayer {
+            sender: sender.clone(),
+        };
+        let subscriber = Registry::default().with(layer);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+        let mut writer = TuiWriter::with_channel(sender, receiver);
         let result = diff_graphs(&source, &target, &diff_config, &mut writer).await;
         if let Err(e) = &result {
             writer.send_error(&e.to_string());
@@ -214,7 +222,13 @@ struct TuiState {
     generation: u64,
     // brief status message (e.g., "Copied!") with expiration time
     status_message: Option<(String, std::time::Instant)>,
+    // ring buffer of recent log lines from tracing events
+    log_lines: VecDeque<(String, tracing::Level)>,
+    // pipeline progress: (current, total) entity count
+    progress: Option<(usize, usize)>,
 }
+
+const LOG_CAPACITY: usize = 50;
 
 impl TuiState {
     fn new() -> Self {
@@ -225,6 +239,8 @@ impl TuiState {
             error: None,
             generation: 0,
             status_message: None,
+            log_lines: VecDeque::with_capacity(LOG_CAPACITY),
+            progress: None,
         }
     }
 }
@@ -233,6 +249,8 @@ enum TuiMessage {
     Diff(Diff),
     Complete,
     Error(String),
+    Log(String, tracing::Level),
+    Progress(usize, usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -398,10 +416,78 @@ fn build_summary_line(label: &str, removed: u64, added: u64, modified: u64) -> L
     ])
 }
 
-impl TuiWriter {
+struct TuiTracingLayer {
+    sender: mpsc::UnboundedSender<TuiMessage>,
+}
+
+struct MessageVisitor {
+    message: Option<String>,
+    progress: Option<usize>,
+    total: Option<usize>,
+}
+
+impl MessageVisitor {
     fn new() -> Self {
-        let state = Arc::new(StdMutex::new(TuiState::new()));
+        Self {
+            message: None,
+            progress: None,
+            total: None,
+        }
+    }
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "neodiff.progress" => self.progress = Some(value as usize),
+            "neodiff.total" => self.total = Some(value as usize),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{:?}", value));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TuiTracingLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = MessageVisitor::new();
+        event.record(&mut visitor);
+        if let (Some(current), Some(total)) = (visitor.progress, visitor.total) {
+            let _ = self.sender.send(TuiMessage::Progress(current, total));
+        }
+        if let Some(message) = visitor.message {
+            let level = *event.metadata().level();
+            let _ = self.sender.send(TuiMessage::Log(message, level));
+        }
+    }
+}
+
+impl TuiWriter {
+    #[allow(dead_code)]
+    fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
+        Self::with_channel(sender, receiver)
+    }
+
+    fn with_channel(
+        sender: mpsc::UnboundedSender<TuiMessage>,
+        receiver: mpsc::UnboundedReceiver<TuiMessage>,
+    ) -> Self {
+        let state = Arc::new(StdMutex::new(TuiState::new()));
         let tui_state = Arc::clone(&state);
         let tui_handle = std::thread::spawn(move || Self::run_tui_loop(tui_state, receiver));
         Self {
@@ -456,6 +542,17 @@ impl TuiWriter {
                         let mut tui_state = state.lock().map_err(|e| e.to_string())?;
                         tui_state.is_complete = true;
                     }
+                    Ok(TuiMessage::Progress(current, total)) => {
+                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
+                        tui_state.progress = Some((current, total));
+                    }
+                    Ok(TuiMessage::Log(line, level)) => {
+                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
+                        if tui_state.log_lines.len() >= LOG_CAPACITY {
+                            tui_state.log_lines.pop_front();
+                        }
+                        tui_state.log_lines.push_back((line, level));
+                    }
                     Ok(TuiMessage::Error(err)) => {
                         let mut tui_state = state.lock().map_err(|e| e.to_string())?;
                         tui_state.error = Some(err);
@@ -471,7 +568,7 @@ impl TuiWriter {
             }
 
             // extract state under lock; rebuild tree items only when generation changes
-            let (summary, is_complete, error, status_msg) = {
+            let (summary, is_complete, error, status_msg, log_lines, progress) = {
                 let tui_state = state.lock().map_err(|e| e.to_string())?;
                 if tui_state.generation != cached_generation {
                     cached_items = Self::build_tree_items(&tui_state);
@@ -488,11 +585,16 @@ impl TuiWriter {
                             None
                         }
                     });
+                let log_lines: Vec<(String, tracing::Level)> =
+                    tui_state.log_lines.iter().cloned().collect();
+                let progress = tui_state.progress;
                 (
                     tui_state.summary.clone(),
                     tui_state.is_complete,
                     tui_state.error.clone(),
                     status_msg,
+                    log_lines,
+                    progress,
                 )
             };
             let items = &cached_items;
@@ -500,10 +602,14 @@ impl TuiWriter {
             spinner_frame = (spinner_frame + 1) % spinner_chars.len();
 
             terminal.draw(|f| {
-                // layout: header row (summary + legend), then diff tree
+                // layout: header row (summary + legend), log panel, then diff tree
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(5), Constraint::Min(0)])
+                    .constraints([
+                        Constraint::Length(5),
+                        Constraint::Length(6),
+                        Constraint::Min(0),
+                    ])
                     .split(f.area());
                 let header_chunks = Layout::default()
                     .direction(Direction::Horizontal)
@@ -521,12 +627,19 @@ impl TuiWriter {
                         Style::default().fg(Color::Green).bold(),
                     ))
                 } else {
+                    let progress_text = match progress {
+                        Some((current, total)) if total > 0 => {
+                            let pct = (current * 100) / total;
+                            format!("Comparing... {}% ({}/{})", pct, current, total)
+                        }
+                        _ => "Comparing...".to_string(),
+                    };
                     Line::from(vec![
                         Span::styled(
                             format!("{} ", spinner_chars[spinner_frame]),
                             Style::default().fg(Color::Cyan),
                         ),
-                        Span::styled("Comparing...", Style::default().fg(Color::Cyan)),
+                        Span::styled(progress_text, Style::default().fg(Color::Cyan)),
                     ])
                 };
                 let summary_text = vec![
@@ -573,6 +686,47 @@ impl TuiWriter {
                     Paragraph::new(legend_text).block(Block::default().borders(Borders::ALL));
                 f.render_widget(legend_widget, header_chunks[1]);
 
+                // log panel
+                let log_panel_height = chunks[1].height.saturating_sub(2) as usize; // subtract border
+                let visible_logs: Vec<Line> = log_lines
+                    .iter()
+                    .rev()
+                    .take(log_panel_height)
+                    .rev()
+                    .map(|(msg, level)| {
+                        let color = match *level {
+                            tracing::Level::ERROR => Color::Red,
+                            tracing::Level::WARN => Color::Yellow,
+                            tracing::Level::INFO => Color::Cyan,
+                            tracing::Level::DEBUG => Color::DarkGray,
+                            tracing::Level::TRACE => Color::DarkGray,
+                        };
+                        let prefix = match *level {
+                            tracing::Level::ERROR => "ERROR",
+                            tracing::Level::WARN => " WARN",
+                            tracing::Level::INFO => " INFO",
+                            tracing::Level::DEBUG => "DEBUG",
+                            tracing::Level::TRACE => "TRACE",
+                        };
+                        Line::from(Span::styled(
+                            format!("{} {}", prefix, msg),
+                            Style::default().fg(color),
+                        ))
+                    })
+                    .collect();
+                let log_title = if is_complete {
+                    " Log (complete) "
+                } else {
+                    " Log "
+                };
+                let log_widget = Paragraph::new(visible_logs).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(log_title)
+                        .title_style(Style::default().bold()),
+                );
+                f.render_widget(log_widget, chunks[1]);
+
                 // diff tree (main content area)
                 let tree_title = if let Some(msg) = &status_msg {
                     format!(" Differences - {} (↑↓ ←→ navigate, c: copy, q: quit) ", msg)
@@ -593,7 +747,7 @@ impl TuiWriter {
                                 .title_style(Style::default().bold()),
                         )
                         .style(Style::default().fg(Color::DarkGray));
-                    f.render_widget(empty_message, chunks[1]);
+                    f.render_widget(empty_message, chunks[2]);
                 } else if let Ok(tree) = Tree::new(items) {
                     let tree = tree
                         .block(
@@ -607,7 +761,7 @@ impl TuiWriter {
                                 .add_modifier(Modifier::BOLD)
                                 .bg(Color::DarkGray),
                         );
-                    f.render_stateful_widget(tree, chunks[1], &mut tree_state);
+                    f.render_stateful_widget(tree, chunks[2], &mut tree_state);
                 }
             })?;
 

@@ -50,6 +50,7 @@ use std::io::Write;
 use std::pin::Pin;
 use strum::VariantNames;
 use strum_macros::{EnumString, IntoStaticStr, VariantNames as VariantNamesMacro};
+use tracing::{debug, info, warn};
 
 /// Compares the *source* and *target* *Neo4j* graphs using the `config`, then outputs the
 /// differences using the `writer`.
@@ -59,9 +60,30 @@ pub async fn diff_graphs(
     config: &DiffConfig,
     writer: &mut dyn DiffWriter,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    info!("Connecting to source: {}", source.uri());
     let source_graph = source.connect().await?;
+    info!("Connecting to target: {}", target.uri());
     let target_graph = target.connect().await?;
+    info!("Discovering schema...");
     let schema = discover_schema(&source_graph, &target_graph, config).await?;
+    info!(
+        "Schema: {} node labels, {} relationship types, {} constraints",
+        schema.nodes.len(),
+        schema.relationships.len(),
+        schema.identifiers.len()
+    );
+    if !schema.source_only_nodes.is_empty() || !schema.target_only_nodes.is_empty() {
+        debug!(
+            "Source-only labels: {:?}, Target-only labels: {:?}",
+            schema.source_only_nodes, schema.target_only_nodes
+        );
+    }
+    if !schema.source_only_rels.is_empty() || !schema.target_only_rels.is_empty() {
+        debug!(
+            "Source-only rel types: {:?}, Target-only rel types: {:?}",
+            schema.source_only_rels, schema.target_only_rels
+        );
+    }
 
     // report schema-level differences (labels/types that exist in only one graph)
     for label in &schema.source_only_nodes {
@@ -98,7 +120,8 @@ pub async fn diff_graphs(
     }
 
     // compare nodes by label using sorted merge
-    for label in &schema.nodes {
+    let total_entities = schema.nodes.len() + schema.relationships.len();
+    for (i, label) in schema.nodes.iter().enumerate() {
         let id_props = schema.identifiers.get(label);
         // only use similarity matching for nodes without unique constraints
         let similarity = if id_props.is_none_or(|p| p.is_empty()) {
@@ -106,6 +129,22 @@ pub async fn diff_graphs(
         } else {
             0
         };
+        if let Some(props) = id_props.filter(|p| !p.is_empty()) {
+            info!(
+                neodiff.progress = i + 1,
+                neodiff.total = total_entities,
+                "Diffing nodes :{} (key: {})",
+                label,
+                props.join(", ")
+            );
+        } else {
+            info!(
+                neodiff.progress = i + 1,
+                neodiff.total = total_entities,
+                "Diffing nodes :{} (properties hash)",
+                label
+            );
+        }
         diff_stream(
             label,
             stream_nodes(
@@ -129,7 +168,14 @@ pub async fn diff_graphs(
     }
 
     // compare relationships by type using sorted merge
-    for rel_type in &schema.relationships {
+    let node_count = schema.nodes.len();
+    for (i, rel_type) in schema.relationships.iter().enumerate() {
+        info!(
+            neodiff.progress = node_count + i + 1,
+            neodiff.total = total_entities,
+            "Diffing relationships [:{}]",
+            rel_type
+        );
         diff_stream(
             rel_type,
             stream_relationships(
@@ -154,6 +200,7 @@ pub async fn diff_graphs(
         .await?;
     }
 
+    info!("Comparison complete");
     writer.summarize().await?;
     Ok(())
 }
@@ -821,11 +868,21 @@ async fn diff_stream<T: Diffable + Clone>(
         }
     }
 
+    if at_limit(count) {
+        warn!("Reached max diff limit ({}) for {}", count, key);
+    }
+
     // skip similarity matching if disabled or nothing to match
     if !use_similarity || (unmatched_source.is_empty() && unmatched_target.is_empty()) {
+        debug!("Finished {}: {} differences", key, count);
         return Ok(());
     }
 
+    debug!(
+        "Similarity matching: {} unmatched source, {} unmatched target",
+        unmatched_source.len(),
+        unmatched_target.len()
+    );
     // perform similarity-based matching on unmatched items
     let threshold = f64::from(similarity_threshold) / 100.0;
     let mut matched_targets: HashSet<usize> = HashSet::new();
@@ -871,6 +928,12 @@ async fn diff_stream<T: Diffable + Clone>(
         }
     }
 
+    debug!(
+        "Finished {}: {} differences ({} similarity matched)",
+        key,
+        count,
+        matched_targets.len()
+    );
     Ok(())
 }
 

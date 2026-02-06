@@ -2,7 +2,7 @@
 name = "neodiff"
 description = "Neo4j graph comparison tool"
 authors = ["c-fraser <cfraser888@gmail.com>"]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 readme = "README.md"
@@ -30,6 +30,8 @@ arboard = "3"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 similar = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [dev-dependencies]
 testcontainers = "0.26.3"
