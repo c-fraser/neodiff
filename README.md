@@ -9,7 +9,7 @@
 A tool to compare and display differences between [Neo4j](http://neo4j.com/) graphs.
 
 <video autoplay loop muted playsinline width="100%">                                                                                                                               
-<source src="docs/demo.webm" type="video/webm">                                                                                                                                  
+<source src="demo/demo.webm" type="video/webm">                                                                                                                                  
 </video>  
 
 ## Install
