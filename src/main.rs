@@ -32,7 +32,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, IsTerminal};
@@ -72,6 +72,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .map(|f| matches!(f, OutputFormat::Tui))
             .unwrap_or_else(|| io::stdout().is_terminal());
 
+    let timeout = args.timeout.map(std::time::Duration::from_secs);
+
     if use_tui {
         let (sender, receiver) = mpsc::unbounded_channel();
         let layer = TuiTracingLayer {
@@ -80,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let subscriber = Registry::default().with(layer);
         let _ = tracing::subscriber::set_global_default(subscriber);
         let mut writer = TuiWriter::with_channel(sender, receiver);
-        let result = diff_graphs(&source, &target, &diff_config, &mut writer).await;
+        let result = run_diff(&source, &target, &diff_config, &mut writer, timeout).await;
         if let Err(e) = &result {
             writer.send_error(&e.to_string());
         }
@@ -94,7 +96,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Some(path) => new_jsonl_writer(File::create(path)?),
             None => new_jsonl_writer(io::stdout()),
         };
-        diff_graphs(&source, &target, &diff_config, writer.as_mut()).await
+        run_diff(&source, &target, &diff_config, writer.as_mut(), timeout).await
     }
 }
 
@@ -150,8 +152,17 @@ struct Args {
     /// Similarity threshold (0-100) for fuzzy matching nodes/relationships without unique
     /// constraints. Entities with property similarity at or above this threshold are reported
     /// as modified rather than separate removed/added diffs. Set to 0 to disable.
-    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<u8>::new().range(0..=100), default_value_t = neodiff::DiffConfig::DEFAULT_SIMILARITY_THRESHOLD)]
+    #[arg(
+        long,
+        value_parser = clap::builder::RangedU64ValueParser::<u8>::new().range(0..=100),
+        default_value_t = neodiff::DiffConfig::DEFAULT_SIMILARITY_THRESHOLD
+    )]
     similarity_threshold: u8,
+
+    /// Maximum seconds to wait for the diff operation before failing. Useful when the Neo4j
+    /// server is slow to respond or the connection is unreliable. No limit by default.
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
+    timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -160,6 +171,23 @@ enum OutputFormat {
     Tui,
     /// JSON Lines format
     Jsonl,
+}
+
+async fn run_diff(
+    source: &GraphConfig,
+    target: &GraphConfig,
+    config: &DiffConfig,
+    writer: &mut dyn DiffWriter,
+    timeout: Option<std::time::Duration>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let fut = diff_graphs(source, target, config, writer);
+    if let Some(duration) = timeout {
+        tokio::time::timeout(duration, fut)
+            .await
+            .unwrap_or_else(|_| Err(format!("timed out after {}s", duration.as_secs()).into()))
+    } else {
+        fut.await
+    }
 }
 
 fn parse_neo4j_uri(uri_str: &str) -> Result<GraphConfig, Box<dyn Error + Send + Sync>> {
@@ -193,7 +221,7 @@ fn parse_neo4j_uri(uri_str: &str) -> Result<GraphConfig, Box<dyn Error + Send + 
     let host = parsed.host_str().ok_or("Host is required")?;
     let port = parsed.port().unwrap_or(7687);
 
-    // Database name from path (e.g., bolt://host:7687/mydb)
+    // database name from path (e.g., bolt://host:7687/mydb)
     let database = {
         let path = parsed.path();
         if path.is_empty() || path == "/" {
@@ -213,8 +241,30 @@ struct TuiWriter {
     handle: Option<std::thread::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>>,
 }
 
+#[derive(Default)]
+struct DiffIndex {
+    next_seq: u64,
+    // schema diffs
+    schema_seqs: Vec<u64>,
+    // node diffs: per-label sequence lists and running counts
+    node_seqs_by_label: BTreeMap<String, Vec<u64>>,
+    node_counts_by_label: BTreeMap<String, DiffCounts>,
+    // relationship attachment: which node keys have node diffs
+    diffed_node_keys: HashSet<String>,
+    node_key_to_label: HashMap<String, String>,
+    // relationship diffs: per-node-key sequence lists and running counts
+    rel_seqs_by_node_key: HashMap<String, Vec<u64>>,
+    rel_node_counts_by_key: HashMap<String, DiffCounts>,
+    rel_counts_by_label: BTreeMap<String, DiffCounts>,
+    // synthetic nodes created for orphan relationships (resides entirely in memory)
+    synthetic_node_refs: HashMap<String, NodeRef>,
+}
+
 struct TuiState {
-    diffs: Vec<Diff>,
+    // temporary on-disk KV store; deleted when dropped
+    db: sled::Db,
+    // lightweight index for tree navigation without loading all diffs
+    index: DiffIndex,
     summary: DiffSummary,
     is_complete: bool,
     error: Option<String>,
@@ -229,11 +279,22 @@ struct TuiState {
 }
 
 const LOG_CAPACITY: usize = 50;
+// maximum node diffs rendered per label group; excess shown as "… N more"
+const TREE_PAGE_SIZE: usize = 200;
+// maximum relationship diffs rendered per node; excess shown as "… N more"
+const REL_PAGE_SIZE: usize = 10;
 
 impl TuiState {
     fn new() -> Self {
+        let db_path = std::env::temp_dir().join(format!("neodiff-{}", process::id()));
+        let db = sled::Config::new()
+            .path(&db_path)
+            .temporary(true)
+            .open()
+            .expect("failed to open temporary sled database");
         Self {
-            diffs: Vec::new(),
+            db,
+            index: DiffIndex::default(),
             summary: DiffSummary::default(),
             is_complete: false,
             error: None,
@@ -244,11 +305,146 @@ impl TuiState {
         }
     }
 
+    fn store_diff(&mut self, diff: Diff) {
+        let seq = self.index.next_seq;
+        self.index.next_seq += 1;
+        let key = seq.to_be_bytes();
+        if let Ok(value) = serde_json::to_vec(&diff) {
+            let _ = self.db.insert(key, value);
+        }
+        self.index.update_with_diff(&diff, seq);
+    }
+
+    fn load_diff(&self, seq: u64) -> Option<Diff> {
+        let key = seq.to_be_bytes();
+        let ivec = self.db.get(key).ok()??;
+        serde_json::from_slice(&ivec).ok()
+    }
+
     fn set_status(&mut self, msg: &str) {
         self.status_message = Some((
             msg.to_string(),
             std::time::Instant::now() + std::time::Duration::from_secs(2),
         ));
+    }
+
+    fn active_status_msg(&self) -> Option<String> {
+        self.status_message
+            .as_ref()
+            .and_then(|(msg, expires)| (std::time::Instant::now() < *expires).then(|| msg.clone()))
+    }
+
+    fn push_log(&mut self, line: String, level: tracing::Level) {
+        if self.log_lines.len() >= LOG_CAPACITY {
+            self.log_lines.pop_front();
+        }
+        self.log_lines.push_back((line, level));
+    }
+}
+
+impl DiffIndex {
+    fn update_with_diff(&mut self, diff: &Diff, seq: u64) {
+        match diff {
+            Diff::SourceNodeLabel { .. }
+            | Diff::TargetNodeLabel { .. }
+            | Diff::SourceRelationshipType { .. }
+            | Diff::TargetRelationshipType { .. } => {
+                self.schema_seqs.push(seq);
+            }
+            Diff::SourceNode {
+                label, properties, ..
+            }
+            | Diff::TargetNode {
+                label, properties, ..
+            } => {
+                let node_ref = NodeRef {
+                    labels: vec![label.clone()],
+                    properties: properties.clone(),
+                };
+                let node_key = TuiWriter::node_ref_key(&node_ref);
+                self.diffed_node_keys.insert(node_key.clone());
+                self.node_key_to_label.insert(node_key, label.clone());
+                self.node_seqs_by_label
+                    .entry(label.clone())
+                    .or_default()
+                    .push(seq);
+                self.node_counts_by_label
+                    .entry(label.clone())
+                    .or_default()
+                    .count_diff(diff);
+            }
+            Diff::ModifiedNode { label, .. } => {
+                // modifiedNode is NOT added to diffed_node_keys; relationships are not
+                // attached to modified nodes (matches existing behavior)
+                self.node_seqs_by_label
+                    .entry(label.clone())
+                    .or_default()
+                    .push(seq);
+                self.node_counts_by_label
+                    .entry(label.clone())
+                    .or_default()
+                    .count_diff(diff);
+            }
+            Diff::SourceRelationship {
+                start_node,
+                end_node,
+                ..
+            }
+            | Diff::TargetRelationship {
+                start_node,
+                end_node,
+                ..
+            }
+            | Diff::ModifiedRelationship {
+                start_node,
+                end_node,
+                ..
+            } => {
+                let start_key = TuiWriter::node_ref_key(start_node);
+                let end_key = TuiWriter::node_ref_key(end_node);
+
+                let attached_key = if self.diffed_node_keys.contains(&start_key) {
+                    start_key
+                } else if self.diffed_node_keys.contains(&end_key) {
+                    end_key
+                } else {
+                    // orphan relationship: synthesize a parent node from the start endpoint
+                    self.synthetic_node_refs
+                        .entry(start_key.clone())
+                        .or_insert_with(|| start_node.clone());
+                    start_key
+                };
+
+                self.rel_seqs_by_node_key
+                    .entry(attached_key.clone())
+                    .or_default()
+                    .push(seq);
+
+                if let Some(cat) = DiffCategory::from_diff(diff) {
+                    self.rel_node_counts_by_key
+                        .entry(attached_key.clone())
+                        .or_default()
+                        .count(cat);
+
+                    // attribute the relationship to whichever label owns the attached node
+                    let label_opt =
+                        self.node_key_to_label
+                            .get(&attached_key)
+                            .cloned()
+                            .or_else(|| {
+                                self.synthetic_node_refs
+                                    .get(&attached_key)
+                                    .and_then(|nr| nr.labels.first().cloned())
+                            });
+                    if let Some(label) = label_opt {
+                        self.rel_counts_by_label
+                            .entry(label)
+                            .or_default()
+                            .count(cat);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -427,34 +623,25 @@ struct TuiTracingLayer {
     sender: mpsc::UnboundedSender<TuiMessage>,
 }
 
+#[derive(Default)]
 struct MessageVisitor {
     message: Option<String>,
     progress: Option<usize>,
     total: Option<usize>,
 }
 
-impl MessageVisitor {
-    fn new() -> Self {
-        Self {
-            message: None,
-            progress: None,
-            total: None,
-        }
-    }
-}
-
 impl tracing::field::Visit for MessageVisitor {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(value.to_string());
-        }
-    }
-
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
         match field.name() {
             "neodiff.progress" => self.progress = Some(value as usize),
             "neodiff.total" => self.total = Some(value as usize),
             _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
         }
     }
 
@@ -471,7 +658,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TuiTracingLayer {
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut visitor = MessageVisitor::new();
+        let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
         if let (Some(current), Some(total)) = (visitor.progress, visitor.total) {
             let _ = self.sender.send(TuiMessage::Progress(current, total));
@@ -484,12 +671,6 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TuiTracingLayer {
 }
 
 impl TuiWriter {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        Self::with_channel(sender, receiver)
-    }
-
     fn with_channel(
         sender: mpsc::UnboundedSender<TuiMessage>,
         receiver: mpsc::UnboundedReceiver<TuiMessage>,
@@ -536,40 +717,30 @@ impl TuiWriter {
         let mut cached_generation: u64 = u64::MAX;
 
         loop {
-            // drain all pending messages without blocking
-            loop {
-                match receiver.try_recv() {
-                    Ok(TuiMessage::Diff(diff)) => {
-                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
-                        tui_state.summary.update(&diff);
-                        tui_state.diffs.push(diff);
-                        tui_state.generation += 1;
-                    }
-                    Ok(TuiMessage::Complete) => {
-                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
-                        tui_state.is_complete = true;
-                    }
-                    Ok(TuiMessage::Progress(current, total)) => {
-                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
-                        tui_state.progress = Some((current, total));
-                    }
-                    Ok(TuiMessage::Log(line, level)) => {
-                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
-                        if tui_state.log_lines.len() >= LOG_CAPACITY {
-                            tui_state.log_lines.pop_front();
+            // drain all pending messages without blocking; hold a single lock for the whole batch
+            {
+                let mut tui_state = state.lock().map_err(|e| e.to_string())?;
+                loop {
+                    match receiver.try_recv() {
+                        Ok(TuiMessage::Diff(diff)) => {
+                            tui_state.summary.update(&diff);
+                            tui_state.store_diff(diff);
+                            tui_state.generation += 1;
                         }
-                        tui_state.log_lines.push_back((line, level));
-                    }
-                    Ok(TuiMessage::Error(err)) => {
-                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
-                        tui_state.error = Some(err);
-                        tui_state.is_complete = true;
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        let mut tui_state = state.lock().map_err(|e| e.to_string())?;
-                        tui_state.is_complete = true;
-                        break;
+                        Ok(TuiMessage::Complete) => tui_state.is_complete = true,
+                        Ok(TuiMessage::Progress(current, total)) => {
+                            tui_state.progress = Some((current, total));
+                        }
+                        Ok(TuiMessage::Log(line, level)) => tui_state.push_log(line, level),
+                        Ok(TuiMessage::Error(err)) => {
+                            tui_state.error = Some(err);
+                            tui_state.is_complete = true;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            tui_state.is_complete = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -581,17 +752,7 @@ impl TuiWriter {
                     cached_items = Self::build_tree_items(&tui_state);
                     cached_generation = tui_state.generation;
                 }
-                // clear expired status messages
-                let status_msg = tui_state
-                    .status_message
-                    .as_ref()
-                    .and_then(|(msg, expires)| {
-                        if std::time::Instant::now() < *expires {
-                            Some(msg.clone())
-                        } else {
-                            None
-                        }
-                    });
+                let status_msg = tui_state.active_status_msg();
                 let log_lines: Vec<(String, tracing::Level)> =
                     tui_state.log_lines.iter().cloned().collect();
                 let progress = tui_state.progress;
@@ -694,7 +855,8 @@ impl TuiWriter {
                 f.render_widget(legend_widget, header_chunks[1]);
 
                 // log panel
-                let log_panel_height = chunks[1].height.saturating_sub(2) as usize; // subtract border
+                // subtract 2 for top and bottom borders
+                let log_panel_height = chunks[1].height.saturating_sub(2) as usize;
                 let visible_logs: Vec<Line> = log_lines
                     .iter()
                     .rev()
@@ -808,9 +970,9 @@ impl TuiWriter {
                         if !selected_path.is_empty() {
                             let mut tui_state = state.lock().map_err(|e| e.to_string())?;
                             if let Some(diff) =
-                                Self::find_diff_by_tree_path(&tui_state.diffs, selected_path)
+                                Self::find_diff_by_tree_path(&tui_state, selected_path)
                             {
-                                if let Some(query) = Self::generate_match_query(diff) {
+                                if let Some(query) = Self::generate_match_query(&diff) {
                                     match arboard::Clipboard::new() {
                                         Ok(mut clipboard) => {
                                             // on Linux, use wait() to fork a background process
@@ -848,228 +1010,230 @@ impl TuiWriter {
     }
 
     // builds the hierarchical tree of diffs for the TUI widget
+    // diffs are loaded lazily from sled: only the first TREE_PAGE_SIZE node diffs per label
+    // and REL_PAGE_SIZE relationship diffs per node are rendered; overflow is shown as a
+    // "… N more" leaf so the tree size stays bounded regardless of graph scale
     fn build_tree_items(state: &TuiState) -> Vec<TreeItem<'static, String>> {
+        let index = &state.index;
         let mut items = Vec::new();
+        let empty_counts = DiffCounts::default();
 
-        // partition diffs by type
-        let mut schema_diffs: Vec<&Diff> = Vec::new();
-        let mut node_diffs: Vec<&Diff> = Vec::new();
-        let mut diffed_node_keys: HashSet<String> = HashSet::new();
-        let mut rel_diffs: Vec<&Diff> = Vec::new();
-        for diff in &state.diffs {
-            match diff {
-                Diff::SourceNodeLabel { .. }
-                | Diff::TargetNodeLabel { .. }
-                | Diff::SourceRelationshipType { .. }
-                | Diff::TargetRelationshipType { .. } => {
-                    schema_diffs.push(diff);
-                }
-                Diff::SourceNode { .. } | Diff::TargetNode { .. } | Diff::ModifiedNode { .. } => {
-                    if let Some((_, node_ref)) = Self::node_diff_to_ref(diff) {
-                        diffed_node_keys.insert(Self::node_ref_key(&node_ref));
-                    }
-                    node_diffs.push(diff);
-                }
-                Diff::SourceRelationship { .. }
-                | Diff::TargetRelationship { .. }
-                | Diff::ModifiedRelationship { .. } => {
-                    rel_diffs.push(diff);
-                }
-            }
-        }
-
-        // group relationships under their connected node; if neither endpoint
-        // is already in node_diffs, create a synthetic "modified" node so the
-        // relationship has a parent in the tree
-        let mut rels_by_node: HashMap<String, Vec<&Diff>> = HashMap::new();
-        let mut synthetic_modified_nodes: HashMap<String, NodeRef> = HashMap::new();
-        for rel_diff in &rel_diffs {
-            let Some((start, end)) = Self::rel_endpoints(rel_diff) else {
-                continue;
-            };
-            let start_key = Self::node_ref_key(start);
-            let end_key = Self::node_ref_key(end);
-            if diffed_node_keys.contains(&start_key) {
-                rels_by_node.entry(start_key).or_default().push(rel_diff);
-            } else if diffed_node_keys.contains(&end_key) {
-                rels_by_node.entry(end_key).or_default().push(rel_diff);
-            } else {
-                // orphan relationship: attach to synthetic start node
-                synthetic_modified_nodes
-                    .entry(start_key.clone())
-                    .or_insert_with(|| start.clone());
-                rels_by_node.entry(start_key).or_default().push(rel_diff);
-            }
-        }
-
-        // schema changes section
-        if !schema_diffs.is_empty() {
-            let schema_children: Vec<_> = schema_diffs
+        if !index.schema_seqs.is_empty() {
+            let schema_children: Vec<_> = index
+                .schema_seqs
                 .iter()
-                .enumerate()
-                .map(|(i, diff)| {
-                    let item_id = format!("schema_{}", i);
-                    let (text, _) = Self::format_diff(diff, &item_id);
+                .filter_map(|&seq| {
+                    let diff = state.load_diff(seq)?;
+                    let item_id = format!("schema_{}", seq);
+                    let (text, _) = Self::format_diff(&diff, &item_id);
                     let style =
-                        DiffCategory::from_diff(diff).map_or(Style::default(), |c| c.style());
-                    TreeItem::new_leaf(item_id, Self::styled_line(&text, style))
+                        DiffCategory::from_diff(&diff).map_or(Style::default(), |c| c.style());
+                    Some(TreeItem::new_leaf(item_id, Self::styled_line(&text, style)))
                 })
                 .collect();
             if let Ok(item) = TreeItem::new(
                 "schema".to_string(),
-                format!("Schema ({})", schema_diffs.len()),
+                format!("Schema ({})", index.schema_seqs.len()),
                 schema_children,
             ) {
                 items.push(item);
             }
         }
 
-        // build node items grouped by label; each node includes its relationships
-        #[allow(clippy::type_complexity)]
-        let mut nodes_by_label: BTreeMap<
-            String,
-            Vec<(String, TreeItem<'static, String>, DiffCounts, DiffCounts)>,
-        > = BTreeMap::new();
-        for (node_idx, node_diff) in node_diffs.iter().enumerate() {
-            let (label, node_ref) = match Self::node_diff_to_ref(node_diff) {
-                Some((l, r)) => (l, r),
-                None => {
-                    if let Diff::ModifiedNode { label, .. } = node_diff {
-                        (label.clone(), NodeRef::default())
-                    } else {
-                        continue;
-                    }
-                }
-            };
-            let node_key = if node_ref.labels.is_empty() {
-                if let Diff::ModifiedNode { label, id, .. } = node_diff {
-                    format!("{}|{}", label, id)
-                } else {
-                    continue;
-                }
-            } else {
-                Self::node_ref_key(&node_ref)
-            };
-            let sort_key = Self::node_sort_key(node_diff);
-            let category_prefix = DiffCategory::from_diff(node_diff)
-                .map(|c| c.prefix())
-                .unwrap_or("?");
-            // include node_idx to guarantee uniqueness even if category + sort_key collide
-            let item_id = format!("node_{}_{}_{}", node_idx, category_prefix, sort_key);
-            let (header, details) = Self::format_diff(node_diff, &item_id);
-            let style = DiffCategory::from_diff(node_diff).map_or(Style::default(), |c| c.style());
-            let mut children: Vec<TreeItem<'static, String>> = details;
-            let mut node_counts = DiffCounts::default();
-            let mut rel_counts = DiffCounts::default();
-            node_counts.count_diff(node_diff);
-            if let Some(rels) = rels_by_node.get(&node_key) {
-                for rel in rels.iter() {
-                    rel_counts.count_diff(rel);
-                }
-                children.extend(Self::build_relationship_items(rels, &node_key, &item_id));
-            }
-            // build header line with optional element_id(s)
-            let header_line = {
-                let mut spans = vec![Span::styled(header.clone(), style)];
-                // append element_id(s) as dimmed text
-                if let Some(eid_display) = Self::format_element_ids(node_diff) {
-                    spans.push(Span::styled(
-                        format!(" {}", eid_display),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-                if rel_counts.total() > 0 {
-                    spans.push(Span::raw(" "));
-                    spans.extend(rel_suffix_spans(&rel_counts));
-                }
-                Line::from(spans)
-            };
-            let node_item = if children.is_empty() {
-                TreeItem::new_leaf(item_id.clone(), header_line)
-            } else {
-                TreeItem::new(item_id.clone(), header_line.clone(), children)
-                    .unwrap_or_else(|_| TreeItem::new_leaf(item_id, header_line))
-            };
-            nodes_by_label.entry(label).or_default().push((
-                sort_key,
-                node_item,
-                node_counts,
-                rel_counts,
-            ));
-        }
+        // collect all labels present in actual diffs or synthetic nodes
+        let all_labels: BTreeSet<String> = index
+            .node_seqs_by_label
+            .keys()
+            .cloned()
+            .chain(
+                index
+                    .synthetic_node_refs
+                    .values()
+                    .filter_map(|nr| nr.labels.first().cloned()),
+            )
+            .collect();
 
-        // add synthetic nodes for orphan relationships
-        for (node_key, node_ref) in synthetic_modified_nodes.iter() {
-            let label = node_ref.labels.first().cloned().unwrap_or_default();
-            let sort_key = node_key.clone();
-            let item_id = format!("synthetic_{}", node_key);
-            let node_counts = DiffCounts::default();
-            let mut rel_counts = DiffCounts::default();
-            let children: Vec<TreeItem<'static, String>> =
-                if let Some(rels) = rels_by_node.get(node_key) {
-                    for rel in rels.iter() {
-                        rel_counts.count_diff(rel);
-                    }
-                    Self::build_relationship_items(rels, node_key, &item_id)
-                } else {
-                    Vec::new()
-                };
-            let mut header_spans = vec![Span::styled(
-                format!("~ {} ", Self::format_node_ref(node_ref)),
-                DiffCategory::Modified.style(),
-            )];
-            header_spans.extend(rel_suffix_spans(&rel_counts));
-            let header_line = Line::from(header_spans);
-            let node_item = if children.is_empty() {
-                TreeItem::new_leaf(item_id.clone(), header_line)
-            } else {
-                TreeItem::new(item_id.clone(), header_line.clone(), children)
-                    .unwrap_or_else(|_| TreeItem::new_leaf(item_id, header_line))
-            };
-            nodes_by_label.entry(label).or_default().push((
-                sort_key,
-                node_item,
-                node_counts,
-                rel_counts,
-            ));
-        }
-
-        // assemble tree: Nodes -> :Label -> individual nodes
-        if !nodes_by_label.is_empty() {
+        if !all_labels.is_empty() {
             let mut total_node_counts = DiffCounts::default();
             let mut total_rel_counts = DiffCounts::default();
-            let label_items: Vec<_> = nodes_by_label
-                .into_iter()
-                .filter_map(|(label, mut node_items)| {
-                    node_items.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
 
-                    let mut label_node_counts = DiffCounts::default();
-                    let mut label_rel_counts = DiffCounts::default();
-                    for (_, _, nc, rc) in &node_items {
-                        label_node_counts.merge(nc);
-                        label_rel_counts.merge(rc);
+            let label_items: Vec<_> = all_labels
+                .iter()
+                .filter_map(|label| {
+                    let node_counts = index
+                        .node_counts_by_label
+                        .get(label)
+                        .unwrap_or(&empty_counts);
+                    let rel_counts = index
+                        .rel_counts_by_label
+                        .get(label)
+                        .unwrap_or(&empty_counts);
+                    total_node_counts.merge(node_counts);
+                    total_rel_counts.merge(rel_counts);
+
+                    let seqs = index.node_seqs_by_label.get(label);
+                    let total_in_label = seqs.map_or(0, |s| s.len());
+
+                    // (sort_key, TreeItem) pairs to be sorted and assembled into children
+                    let mut node_entries: Vec<(String, TreeItem<'static, String>)> = Vec::new();
+
+                    // load the first TREE_PAGE_SIZE node diffs for this label
+                    if let Some(seqs) = seqs {
+                        for &seq in seqs.iter().take(TREE_PAGE_SIZE) {
+                            let Some(diff) = state.load_diff(seq) else {
+                                continue;
+                            };
+                            let sort_key = Self::node_sort_key(&diff);
+                            let category_prefix = DiffCategory::from_diff(&diff)
+                                .map(|c| c.prefix())
+                                .unwrap_or("?");
+                            let item_id = format!("node_{}_{}_{}", seq, category_prefix, sort_key);
+                            let node_key = Self::diff_node_key(&diff);
+                            let (header, details) = Self::format_diff(&diff, &item_id);
+                            let style = DiffCategory::from_diff(&diff)
+                                .map_or(Style::default(), |c| c.style());
+                            let node_rel_counts = index
+                                .rel_node_counts_by_key
+                                .get(&node_key)
+                                .unwrap_or(&empty_counts);
+                            let mut children: Vec<TreeItem<'static, String>> = details;
+                            children
+                                .extend(Self::build_paged_rel_children(state, &node_key, &item_id));
+
+                            let mut spans = vec![Span::styled(header, style)];
+                            if let Some(eid_display) = Self::format_element_ids(&diff) {
+                                spans.push(Span::styled(
+                                    format!(" {}", eid_display),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
+                            }
+                            if node_rel_counts.total() > 0 {
+                                spans.push(Span::raw(" "));
+                                spans.extend(rel_suffix_spans(node_rel_counts));
+                            }
+                            let node_item =
+                                Self::make_tree_item(item_id, Line::from(spans), children);
+                            node_entries.push((sort_key, node_item));
+                        }
+
+                        // show a "… N more" leaf when the label has more diffs than the page
+                        if total_in_label > TREE_PAGE_SIZE {
+                            let overflow = total_in_label - TREE_PAGE_SIZE;
+                            node_entries.push((
+                                "\u{FFFF}".to_string(), // sorts after any real key
+                                TreeItem::new_leaf(
+                                    format!("overflow_{}", label),
+                                    Line::from(Span::styled(
+                                        format!("... {} more", overflow),
+                                        Style::default().fg(Color::DarkGray),
+                                    )),
+                                ),
+                            ));
+                        }
                     }
-                    total_node_counts.merge(&label_node_counts);
-                    total_rel_counts.merge(&label_rel_counts);
 
-                    let sorted_items: Vec<_> =
-                        node_items.into_iter().map(|(_, item, _, _)| item).collect();
-                    let header = summary_header(
-                        &format!(":{}", label),
-                        &label_node_counts,
-                        &label_rel_counts,
-                        false,
-                    );
-                    TreeItem::new(format!("label_{}", label), header, sorted_items).ok()
+                    // add synthetic nodes (orphan rel parents) for this label
+                    for (node_key, node_ref) in &index.synthetic_node_refs {
+                        if node_ref.labels.first().is_none_or(|l| l != label) {
+                            continue;
+                        }
+                        let sort_key = node_key.clone();
+                        let item_id = format!("synthetic_{}", node_key);
+                        let node_rel_counts = index
+                            .rel_node_counts_by_key
+                            .get(node_key)
+                            .unwrap_or(&empty_counts);
+                        let children = Self::build_paged_rel_children(state, node_key, &item_id);
+                        let mut header_spans = vec![Span::styled(
+                            format!("~ {} ", Self::format_node_ref(node_ref)),
+                            DiffCategory::Modified.style(),
+                        )];
+                        if node_rel_counts.total() > 0 {
+                            header_spans.extend(rel_suffix_spans(node_rel_counts));
+                        }
+                        let node_item =
+                            Self::make_tree_item(item_id, Line::from(header_spans), children);
+                        node_entries.push((sort_key, node_item));
+                    }
+
+                    if node_entries.is_empty() {
+                        return None;
+                    }
+                    node_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    let children: Vec<_> = node_entries.into_iter().map(|(_, item)| item).collect();
+                    let header =
+                        summary_header(&format!(":{}", label), node_counts, rel_counts, false);
+                    TreeItem::new(format!("label_{}", label), header, children).ok()
                 })
                 .collect();
 
-            let total_header = summary_header("Nodes", &total_node_counts, &total_rel_counts, true);
-            if let Ok(item) = TreeItem::new("nodes".to_string(), total_header, label_items) {
-                items.push(item);
+            if !label_items.is_empty() {
+                let total_header =
+                    summary_header("Nodes", &total_node_counts, &total_rel_counts, true);
+                if let Ok(item) = TreeItem::new("nodes".to_string(), total_header, label_items) {
+                    items.push(item);
+                }
             }
         }
+
         items
+    }
+
+    fn diff_node_key(diff: &Diff) -> String {
+        match diff {
+            Diff::SourceNode {
+                label, properties, ..
+            }
+            | Diff::TargetNode {
+                label, properties, ..
+            } => Self::node_ref_key(&NodeRef {
+                labels: vec![label.clone()],
+                properties: properties.clone(),
+            }),
+            Diff::ModifiedNode { label, id, .. } => format!("{}|{}", label, id),
+            _ => String::new(),
+        }
+    }
+
+    fn make_tree_item(
+        id: String,
+        line: Line<'static>,
+        children: Vec<TreeItem<'static, String>>,
+    ) -> TreeItem<'static, String> {
+        if children.is_empty() {
+            TreeItem::new_leaf(id, line)
+        } else {
+            TreeItem::new(id.clone(), line.clone(), children)
+                .unwrap_or_else(|_| TreeItem::new_leaf(id, line))
+        }
+    }
+
+    fn build_paged_rel_children(
+        state: &TuiState,
+        node_key: &str,
+        item_id: &str,
+    ) -> Vec<TreeItem<'static, String>> {
+        let Some(rel_seqs) = state.index.rel_seqs_by_node_key.get(node_key) else {
+            return Vec::new();
+        };
+        let overflow = rel_seqs.len().saturating_sub(REL_PAGE_SIZE);
+        let rels: Vec<Diff> = rel_seqs
+            .iter()
+            .take(REL_PAGE_SIZE)
+            .filter_map(|&seq| state.load_diff(seq))
+            .collect();
+        let rel_refs: Vec<&Diff> = rels.iter().collect();
+        let mut result = Self::build_relationship_items(&rel_refs, node_key, item_id);
+        if overflow > 0 {
+            result.push(TreeItem::new_leaf(
+                format!("{}_rel_overflow", item_id),
+                Line::from(Span::styled(
+                    format!("... {} more", overflow),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ));
+        }
+        result
     }
 
     fn build_relationship_items(
@@ -1141,18 +1305,21 @@ impl TuiWriter {
                 id,
                 properties,
                 ..
+            } => {
+                let header = format!("- (:{} {{{}}})", label, id);
+                (
+                    header,
+                    get_details(properties, DiffCategory::Removed.style()),
+                )
             }
-            | Diff::TargetNode {
+            Diff::TargetNode {
                 label,
                 id,
                 properties,
                 ..
             } => {
-                let prefix = DiffCategory::from_diff(diff).map_or("-", |c| c.prefix());
-                let style = DiffCategory::from_diff(diff).map_or(Style::default(), |c| c.style());
-                let header = format!("{} (:{} {{{}}})", prefix, label, id);
-                let details: Vec<_> = get_details(properties, style);
-                (header, details)
+                let header = format!("+ (:{} {{{}}})", label, id);
+                (header, get_details(properties, DiffCategory::Added.style()))
             }
             Diff::ModifiedNode {
                 label, id, changes, ..
@@ -1167,25 +1334,32 @@ impl TuiWriter {
                 end_node,
                 properties,
                 ..
+            } => {
+                let header = format!(
+                    "- {}-[:{}]->{}",
+                    Self::format_node_ref(start_node),
+                    relationship_type,
+                    Self::format_node_ref(end_node)
+                );
+                (
+                    header,
+                    get_details(properties, DiffCategory::Removed.style()),
+                )
             }
-            | Diff::TargetRelationship {
+            Diff::TargetRelationship {
                 relationship_type,
                 start_node,
                 end_node,
                 properties,
                 ..
             } => {
-                let prefix = DiffCategory::from_diff(diff).map_or("-", |c| c.prefix());
-                let style = DiffCategory::from_diff(diff).map_or(Style::default(), |c| c.style());
                 let header = format!(
-                    "{} {}-[:{}]->{}",
-                    prefix,
+                    "+ {}-[:{}]->{}",
                     Self::format_node_ref(start_node),
                     relationship_type,
                     Self::format_node_ref(end_node)
                 );
-                let details: Vec<_> = get_details(properties, style);
-                (header, details)
+                (header, get_details(properties, DiffCategory::Added.style()))
             }
             Diff::ModifiedRelationship {
                 relationship_type,
@@ -1323,8 +1497,7 @@ impl TuiWriter {
                 })
                 .collect();
             let header_line = Line::from(Span::styled(format!("  {} {}:", prefix, key), style));
-            TreeItem::new(id.to_string(), header_line.clone(), children)
-                .unwrap_or_else(|_| TreeItem::new_leaf(id.to_string(), header_line))
+            Self::make_tree_item(id.to_string(), header_line, children)
         }
     }
 
@@ -1399,8 +1572,7 @@ impl TuiWriter {
                 ));
             }
 
-            TreeItem::new(id.to_string(), header_line.clone(), children)
-                .unwrap_or_else(|_| TreeItem::new_leaf(id.to_string(), header_line))
+            Self::make_tree_item(id.to_string(), header_line, children)
         }
     }
 
@@ -1474,7 +1646,8 @@ impl TuiWriter {
                 let src = source_element_id.as_deref()?;
                 let tgt = target_element_id.as_deref()?;
                 Some(format!(
-                    "// source\nMATCH (n) WHERE elementId(n) = '{}' RETURN n\n// target\nMATCH (n) WHERE elementId(n) = '{}' RETURN n",
+                    "// source\nMATCH (n) WHERE elementId(n) = '{}' RETURN n\n\
+                     // target\nMATCH (n) WHERE elementId(n) = '{}' RETURN n",
                     src, tgt
                 ))
             }
@@ -1497,7 +1670,8 @@ impl TuiWriter {
                 let src = source_element_id.as_deref()?;
                 let tgt = target_element_id.as_deref()?;
                 Some(format!(
-                    "// source\nMATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r\n// target\nMATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r",
+                    "// source\nMATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r\n\
+                     // target\nMATCH ()-[r]->() WHERE elementId(r) = '{}' RETURN r",
                     src, tgt
                 ))
             }
@@ -1505,115 +1679,40 @@ impl TuiWriter {
         }
     }
 
-    // finds the diff corresponding to a tree selection path
-    fn find_diff_by_tree_path<'a>(diffs: &'a [Diff], path: &[String]) -> Option<&'a Diff> {
-        // tree path examples:
-        // ["nodes", "label_Person", "node_Alice"] -> node diff with id "Alice"
-        // ["schema", "schema_0"] -> first schema diff
+    // finds the diff corresponding to a tree selection path by reading from sled
+    // tree item IDs encode the sled sequence key so lookups are O(1)
+    fn find_diff_by_tree_path(state: &TuiState, path: &[String]) -> Option<Diff> {
         if path.is_empty() {
             return None;
         }
 
-        // check for node path: ["nodes", "label_X", "node_{idx}_{category}_{id}"]
+        // node path: ["nodes", "label_X", "node_{seq}_{prefix}_{id}"]
         if path.len() >= 3 && path[0] == "nodes" {
             let last = path.last()?;
-            // parse format: "node_{idx}_{prefix}_{id}" where prefix is -, +, or ~
             if let Some(rest) = last.strip_prefix("node_") {
-                // find the index (first segment before _)
+                // seq is the first segment before the first '_'
                 let first_underscore = rest.find('_')?;
-                let idx_str = &rest[..first_underscore];
-                let idx: usize = idx_str.parse().ok()?;
-                let after_idx = &rest[first_underscore + 1..];
-
-                // extract category prefix and id
-                let (category_char, id) = if let Some(id) = after_idx.strip_prefix("-_") {
-                    (Some('-'), id)
-                } else if let Some(id) = after_idx.strip_prefix("+_") {
-                    (Some('+'), id)
-                } else if let Some(id) = after_idx.strip_prefix("~_") {
-                    (Some('~'), id)
-                } else {
-                    // fallback for unknown prefix
-                    (None, after_idx)
-                };
-
-                // use the index to directly get the diff from node_diffs
-                let node_diffs: Vec<_> = diffs
-                    .iter()
-                    .filter(|d| {
-                        matches!(
-                            d,
-                            Diff::SourceNode { .. }
-                                | Diff::TargetNode { .. }
-                                | Diff::ModifiedNode { .. }
-                        )
-                    })
-                    .collect();
-
-                if let Some(&diff) = node_diffs.get(idx) {
-                    // verify it matches the expected id and category
-                    let id_matches = match diff {
-                        Diff::SourceNode { id: node_id, .. }
-                        | Diff::TargetNode { id: node_id, .. }
-                        | Diff::ModifiedNode { id: node_id, .. } => node_id == id,
-                        _ => false,
-                    };
-                    let category_matches = match category_char {
-                        Some('-') => matches!(diff, Diff::SourceNode { .. }),
-                        Some('+') => matches!(diff, Diff::TargetNode { .. }),
-                        Some('~') => matches!(diff, Diff::ModifiedNode { .. }),
-                        None | Some(_) => true,
-                    };
-                    if id_matches && category_matches {
-                        return Some(diff);
-                    }
-                }
-                return None;
+                let seq: u64 = rest[..first_underscore].parse().ok()?;
+                return state.load_diff(seq);
             }
             if let Some(key) = last.strip_prefix("synthetic_") {
-                // synthetic nodes don't have direct diffs, but their relationships do
-                // try to find a relationship attached to this synthetic node
-                return diffs.iter().find(|d| match d {
-                    Diff::SourceRelationship { start_node, .. }
-                    | Diff::TargetRelationship { start_node, .. }
-                    | Diff::ModifiedRelationship { start_node, .. } => {
-                        Self::node_ref_key(start_node) == key
-                    }
-                    _ => false,
-                });
+                // synthetic nodes have no direct diff; return the first attached rel instead
+                return state
+                    .index
+                    .rel_seqs_by_node_key
+                    .get(key)
+                    .and_then(|seqs| seqs.first().copied())
+                    .and_then(|seq| state.load_diff(seq));
             }
         }
 
-        // check for relationship path under a node: [..., "node_X_rel_N"]
-        for item in path.iter() {
-            if item.contains("_rel_") {
-                // this is a relationship item; we need to find which rel it corresponds to
-                // the format is "{node_item_id}_rel_{index}"
-                // we can try to match by index within the relationship diffs
-                // For now, return None as relationship selection is more complex
-                return None;
+        // schema path: ["schema", "schema_{seq}"]
+        if path.len() >= 2 && path[0] == "schema" {
+            if let Some(seq_str) = path[1].strip_prefix("schema_") {
+                if let Ok(seq) = seq_str.parse::<u64>() {
+                    return state.load_diff(seq);
+                }
             }
-        }
-
-        // check for schema path: ["schema", "schema_N"]
-        if path.len() >= 2
-            && path[0] == "schema"
-            && let Some(idx_str) = path[1].strip_prefix("schema_")
-            && let Ok(idx) = idx_str.parse::<usize>()
-        {
-            let schema_diffs: Vec<_> = diffs
-                .iter()
-                .filter(|d| {
-                    matches!(
-                        d,
-                        Diff::SourceNodeLabel { .. }
-                            | Diff::TargetNodeLabel { .. }
-                            | Diff::SourceRelationshipType { .. }
-                            | Diff::TargetRelationshipType { .. }
-                    )
-                })
-                .collect();
-            return schema_diffs.get(idx).copied();
         }
 
         None
@@ -1654,24 +1753,6 @@ impl TuiWriter {
         let labels = node_ref.labels.join(":");
         let props = serde_json::to_string(&node_ref.properties).unwrap_or_default();
         format!("{}|{}", labels, props)
-    }
-
-    fn node_diff_to_ref(diff: &Diff) -> Option<(String, NodeRef)> {
-        match diff {
-            Diff::SourceNode {
-                label, properties, ..
-            }
-            | Diff::TargetNode {
-                label, properties, ..
-            } => Some((
-                label.clone(),
-                NodeRef {
-                    labels: vec![label.clone()],
-                    properties: properties.clone(),
-                },
-            )),
-            _ => None,
-        }
     }
 
     fn node_sort_key(diff: &Diff) -> String {

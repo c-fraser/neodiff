@@ -27,9 +27,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!     let source = GraphConfig::new("bolt://source:7687", "neo4j", "pass", None);
 //!     let target = GraphConfig::new("bolt://target:7687", "neo4j", "pass", None);
-//!     // Only emit ModifiedNode diffs
-//!     let diff_kinds = Some(HashSet::from(["ModifiedNode".to_string()]));
-//!     let config = DiffConfig::new(vec![], vec![], vec![], vec![], vec![".*_at$".into()], None, diff_kinds, None)?;
+//!     let config = DiffConfig::new(vec![], vec![], vec![], vec![], vec![], None, None, None)?;
 //!     let mut writer = new_jsonl_writer(std::io::stdout());
 //!     diff_graphs(&source, &target, &config, writer.as_mut()).await
 //! }
@@ -61,9 +59,8 @@ pub async fn diff_graphs(
     writer: &mut dyn DiffWriter,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("Connecting to source: {}", source.uri());
-    let source_graph = source.connect().await?;
     info!("Connecting to target: {}", target.uri());
-    let target_graph = target.connect().await?;
+    let (source_graph, target_graph) = tokio::try_join!(source.connect(), target.connect())?;
     info!("Discovering schema...");
     let schema = discover_schema(&source_graph, &target_graph, config).await?;
     info!(
@@ -653,18 +650,15 @@ async fn discover_schema(
         query_constraints(target),
     )?;
 
-    // merge constraints: use source constraint if target matches or is absent,
+    // merge constraints: use source constraint if target matches or is absent;
     // skip labels where constraints differ (no reliable identifier)
     let mut constraints = HashMap::new();
     for (label, src_props) in &src_constraints {
-        match tgt_constraints.get(label) {
-            Some(tgt_props) if tgt_props == src_props => {
-                constraints.insert(label.clone(), src_props.clone());
-            }
-            None => {
-                constraints.insert(label.clone(), src_props.clone());
-            }
-            _ => {}
+        if tgt_constraints
+            .get(label)
+            .is_none_or(|tgt| tgt == src_props)
+        {
+            constraints.insert(label.clone(), src_props.clone());
         }
     }
     for (label, tgt_props) in tgt_constraints {
@@ -1167,8 +1161,11 @@ fn stream_relationships<'a>(
                   {end_props_expr} AS end_props, \
                   {rel_props_expr} AS props \
              WITH r, s, e, start_props, end_props, props, \
-                  ({start_id_expr}) + '->' + ({end_id_expr}) + ':' + apoc.hashing.fingerprint(props) AS __id \
-             RETURN __id, elementId(r) AS element_id, labels(s) AS start_labels, start_props, labels(e) AS end_labels, end_props, props \
+                  ({start_id_expr}) + '->' + ({end_id_expr}) + \
+                  ':' + apoc.hashing.fingerprint(props) AS __id \
+             RETURN __id, elementId(r) AS element_id, \
+                    labels(s) AS start_labels, start_props, \
+                    labels(e) AS end_labels, end_props, props \
              ORDER BY __id"
         ));
 
@@ -1268,7 +1265,9 @@ fn build_props_expr(map_var: &str, exclude_patterns: &Patterns) -> String {
 
     let list = exclude_patterns.to_cypher_list();
     format!(
-        "apoc.map.fromPairs([k IN keys({map_var}) WHERE NOT any(p IN [{list}] WHERE k =~ p) | [k, {map_var}[k]]])"
+        "apoc.map.fromPairs([k IN keys({map_var}) \
+         WHERE NOT any(p IN [{list}] WHERE k =~ p) \
+         | [k, {map_var}[k]]])"
     )
 }
 
@@ -1493,12 +1492,14 @@ mod tests {
         let env = guard.as_ref().unwrap();
         env.clear().await?;
         env.both(&[
-                "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE (p.name) IS UNIQUE",
-                "CREATE (p:Person {name: 'Alice', born: 1990})",
-                "CREATE (p:Person {name: 'Bob', born: 1985})",
-                "CREATE (m:Movie {title: 'Test Movie', released: 2020})",
-                "MATCH (a:Person {name: 'Alice'}), (m:Movie {title: 'Test Movie'}) CREATE (a)-[:ACTED_IN {roles: ['Lead']}]->(m)",
-            ]).await?;
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE (p.name) IS UNIQUE",
+            "CREATE (p:Person {name: 'Alice', born: 1990})",
+            "CREATE (p:Person {name: 'Bob', born: 1985})",
+            "CREATE (m:Movie {title: 'Test Movie', released: 2020})",
+            "MATCH (a:Person {name: 'Alice'}), (m:Movie {title: 'Test Movie'}) \
+                 CREATE (a)-[:ACTED_IN {roles: ['Lead']}]->(m)",
+        ])
+        .await?;
         let summary = env.diff().await?.summarize().await?;
         assert_eq!(summary.total(), 0);
         Ok(())
@@ -1589,13 +1590,21 @@ mod tests {
             "CREATE (m:Movie {title: 'Test Movie', released: 2020})",
         ])
         .await?;
-        env.source(&["MATCH (a:Person {name: 'Alice'}), (m:Movie {title: 'Test Movie'}) CREATE (a)-[:ACTED_IN {roles: ['Lead']}]->(m)"]).await?;
+        env.source(&[
+            "MATCH (a:Person {name: 'Alice'}), (m:Movie {title: 'Test Movie'}) \
+             CREATE (a)-[:ACTED_IN {roles: ['Lead']}]->(m)",
+        ])
+        .await?;
         let mut writer = env.diff().await?;
         let summary = writer.summarize().await?;
         assert_eq!(summary.relationships_removed, 1);
         let has_rel_type_diff = writer.diffs().iter().any(|d| {
-                matches!(d, Diff::SourceRelationshipType { relationship_type } if relationship_type == "ACTED_IN")
-            });
+            matches!(
+                d,
+                Diff::SourceRelationshipType { relationship_type }
+                    if relationship_type == "ACTED_IN"
+            )
+        });
         assert!(has_rel_type_diff);
         Ok(())
     }
@@ -1612,7 +1621,11 @@ mod tests {
             "CREATE (m:Movie {title: 'Test Movie', released: 2020})",
         ])
         .await?;
-        env.target(&["MATCH (a:Person {name: 'Alice'}), (m:Movie {title: 'Test Movie'}) CREATE (a)-[:ACTED_IN {roles: ['Lead']}]->(m)"]).await?;
+        env.target(&[
+            "MATCH (a:Person {name: 'Alice'}), (m:Movie {title: 'Test Movie'}) \
+             CREATE (a)-[:ACTED_IN {roles: ['Lead']}]->(m)",
+        ])
+        .await?;
         let summary = env.diff().await?.summarize().await?;
         assert_eq!(summary.relationships_added, 1);
         assert_eq!(summary.relationships_removed, 0);
@@ -1772,8 +1785,13 @@ mod tests {
         )?;
         let diffs = env.diff_with(config).await?.diffs();
         let likes_diffs = diffs.iter().any(|d| {
-                matches!(d, Diff::SourceRelationship { relationship_type, .. } | Diff::TargetRelationship { relationship_type, .. } if relationship_type == "LIKES")
-            });
+            matches!(
+                d,
+                Diff::SourceRelationship { relationship_type, .. }
+                    | Diff::TargetRelationship { relationship_type, .. }
+                        if relationship_type == "LIKES"
+            )
+        });
         assert!(!likes_diffs);
         Ok(())
     }
@@ -1785,7 +1803,7 @@ mod tests {
         env.clear().await?;
         env.both(&["CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE (p.name) IS UNIQUE"])
             .await?;
-        // Create different diffs: added, removed, and modified nodes
+        // create different diffs: added, removed, and modified nodes
         env.source(&[
             "CREATE (p:Person {name: 'Alice', born: 1990})",
             "CREATE (p:Person {name: 'Bob', born: 1985})",
@@ -1797,7 +1815,7 @@ mod tests {
         ])
         .await?;
 
-        // Only include ModifiedNode diffs
+        // only include ModifiedNode diffs
         let config = DiffConfig::new(
             vec![],
             vec![],
@@ -1810,7 +1828,7 @@ mod tests {
         )?;
         let diffs = env.diff_with(config).await?.diffs();
 
-        // Should only have ModifiedNode diffs (Alice)
+        // should only have ModifiedNode diffs (Alice)
         assert!(diffs.iter().all(|d| matches!(d, Diff::ModifiedNode { .. })));
         assert_eq!(diffs.len(), 1);
         Ok(())
@@ -1850,8 +1868,8 @@ mod tests {
         let guard = get_env().await?;
         let env = guard.as_ref().unwrap();
         env.clear().await?;
-        // Create nodes WITHOUT uniqueness constraints - they'll be matched by property hash
-        // Source and target have same node with one different property (75% similar)
+        // create nodes WITHOUT uniqueness constraints - they'll be matched by property hash
+        // source and target have same node with one different property (75% similar)
         env.source(&[
             "CREATE (a:Item {name: 'Widget', price: 100, category: 'Tools', sku: 'W001'})",
         ])
@@ -1861,11 +1879,11 @@ mod tests {
         ])
         .await?;
 
-        // With default 75% threshold, should detect as modified (3/4 = 75% match)
+        // with default 75% threshold, should detect as modified (3/4 = 75% match)
         let config = DiffConfig::default();
         let diffs = env.diff_with(config).await?.diffs();
 
-        // Should have exactly one ModifiedNode diff (not SourceNode + TargetNode)
+        // should have exactly one ModifiedNode diff (not SourceNode + TargetNode)
         let modified_count = diffs
             .iter()
             .filter(|d| matches!(d, Diff::ModifiedNode { .. }))
@@ -1883,7 +1901,7 @@ mod tests {
         assert_eq!(source_count, 0, "Expected 0 SourceNode diffs");
         assert_eq!(target_count, 0, "Expected 0 TargetNode diffs");
 
-        // Verify the modified diff has the correct change
+        // verify the modified diff has the correct change
         let modified = diffs
             .iter()
             .find(|d| matches!(d, Diff::ModifiedNode { .. }))
@@ -1901,7 +1919,7 @@ mod tests {
         let guard = get_env().await?;
         let env = guard.as_ref().unwrap();
         env.clear().await?;
-        // Same setup as above but with similarity matching disabled
+        // same setup as above but with similarity matching disabled
         env.source(&[
             "CREATE (a:Item {name: 'Widget', price: 100, category: 'Tools', sku: 'W001'})",
         ])
@@ -1911,11 +1929,11 @@ mod tests {
         ])
         .await?;
 
-        // With 0% threshold, similarity matching is disabled
+        // with 0% threshold, similarity matching is disabled
         let config = DiffConfig::new(vec![], vec![], vec![], vec![], vec![], None, None, Some(0))?;
         let diffs = env.diff_with(config).await?.diffs();
 
-        // Should have SourceNode + TargetNode (no matching)
+        // should have SourceNode + TargetNode (no matching)
         let modified_count = diffs
             .iter()
             .filter(|d| matches!(d, Diff::ModifiedNode { .. }))
