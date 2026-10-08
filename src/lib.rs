@@ -1301,8 +1301,8 @@ impl<W: Write + Send + Sync> DiffWriter for JsonLinesWriter<W> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, OnceLock};
-    use testcontainers::ContainerAsync;
     use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, ImageExt, ReuseDirective};
     use testcontainers_modules::neo4j::{Neo4j, Neo4jImage, Neo4jLabsPlugin};
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -1353,10 +1353,20 @@ mod tests {
 
     impl TestEnv {
         async fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
+            // named and reused across runs since a `static` is never dropped, so the containers
+            // would otherwise outlive the test process
             let neo4j = Neo4j::default().with_neo4j_labs_plugin(&[Neo4jLabsPlugin::Apoc]);
-            let source_container = neo4j.clone().start().await?;
-            let target_container = neo4j.start().await?;
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let source_container = neo4j
+                .clone()
+                .with_container_name("neodiff-test-source")
+                .with_reuse(ReuseDirective::Always)
+                .start()
+                .await?;
+            let target_container = neo4j
+                .with_container_name("neodiff-test-target")
+                .with_reuse(ReuseDirective::Always)
+                .start()
+                .await?;
             let source_uri = format!(
                 "bolt://127.0.0.1:{}",
                 source_container.get_host_port_ipv4(7687).await?
@@ -1365,12 +1375,18 @@ mod tests {
                 "bolt://127.0.0.1:{}",
                 target_container.get_host_port_ipv4(7687).await?
             );
-            Ok(Self {
+            let env = Self {
                 source_container,
                 target_container,
                 source_uri,
                 target_uri,
-            })
+            };
+            // a reused container may still be booting after a restart, and holds prior data
+            for uri in [&env.source_uri, &env.target_uri] {
+                wait_until_ready(uri).await?;
+            }
+            env.clear().await?;
+            Ok(env)
         }
 
         async fn clear(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1419,6 +1435,17 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    async fn wait_until_ready(uri: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match run_queries(uri, &["RETURN 1"]).await {
+                Ok(()) => return Ok(()),
+                Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+            }
+        }
     }
 
     static TEST_ENV: OnceLock<AsyncMutex<Option<TestEnv>>> = OnceLock::new();
